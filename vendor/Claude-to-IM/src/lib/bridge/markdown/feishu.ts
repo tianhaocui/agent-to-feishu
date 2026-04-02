@@ -202,17 +202,31 @@ export function htmlToFeishuMarkdown(html: string): string {
 
 /**
  * Build tool progress markdown lines.
+ * Shows elapsed time for running tools so users know the AI is still working.
  */
 export function buildToolProgressMarkdown(tools: ToolCallInfo[]): string {
   if (tools.length === 0) return '';
+  const now = Date.now();
   const running = tools.filter(tc => tc.status === 'running');
   const done = tools.filter(tc => tc.status === 'complete');
   const failed = tools.filter(tc => tc.status !== 'running' && tc.status !== 'complete');
   const lines: string[] = [];
-  for (const tc of running) lines.push(`🔄 \`${tc.name}\``);
+  for (const tc of running) {
+    const elapsed = tc.startedAt ? formatElapsedRound(now - tc.startedAt) : '';
+    lines.push(elapsed ? `🔄 \`${tc.name}\` (${elapsed})` : `🔄 \`${tc.name}\``);
+  }
   for (const tc of failed) lines.push(`❌ \`${tc.name}\``);
   if (done.length > 0) lines.push(`✅ ${done.length} tool${done.length > 1 ? 's' : ''} done`);
   return lines.join('\n');
+}
+
+/** Format elapsed time as rounded integers (no decimals). */
+function formatElapsedRound(ms: number): string {
+  const sec = Math.round(ms / 1000);
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  const remSec = sec % 60;
+  return `${min}m ${remSec}s`;
 }
 
 /**
@@ -368,6 +382,65 @@ export function buildFinalCardJson(
 /**
  * Build a permission card with real action buttons (column_set layout).
  */
+/**
+ * Build a pairing approval card with Approve/Reject buttons.
+ * Sent to admin chat when an unapproved user requests access.
+ */
+export function buildPairingApprovalCard(
+  userId: string,
+  pairingCode: string,
+  messagePreview: string,
+  chatId?: string,
+): string {
+  const buttons = [
+    { label: '✅ 批准 Approve', type: 'primary', action: 'approve' },
+    { label: '❌ 拒绝 Reject', type: 'danger', action: 'reject' },
+  ];
+
+  const buttonColumns = buttons.map((btn) => ({
+    tag: 'column',
+    width: 'auto',
+    elements: [{
+      tag: 'button',
+      text: { tag: 'plain_text', content: btn.label },
+      type: btn.type,
+      size: 'medium',
+      value: { callback_data: `pairing:${btn.action}:${pairingCode}`, ...(chatId ? { chatId } : {}) },
+    }],
+  }));
+
+  const preview = messagePreview
+    ? messagePreview.replace(/[*_`#>[\]()~]/g, '').slice(0, 150)
+    : '(无预览)';
+
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: '配对审批 Pairing Approval',
+      },
+      template: 'orange',
+      icon: { tag: 'standard_icon', token: 'people-add_filled' },
+    },
+    body: {
+      elements: [
+        { tag: 'markdown', content: `**用户 User:** \`${userId}\``, text_size: 'normal' },
+        { tag: 'markdown', content: `**配对码 Code:** \`${pairingCode}\``, text_size: 'normal' },
+        { tag: 'markdown', content: `**消息预览 Preview:** ${preview}`, text_size: 'normal' },
+        { tag: 'hr' },
+        {
+          tag: 'column_set',
+          flex_mode: 'none',
+          horizontal_align: 'left',
+          columns: buttonColumns,
+        },
+      ],
+    },
+  });
+}
+
 export function buildPermissionButtonCard(
   text: string,
   permissionRequestId: string,

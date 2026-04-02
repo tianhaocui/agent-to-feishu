@@ -588,6 +588,21 @@ async function handleMessage(
 
   if (!text && !hasAttachments) { ack(); return; }
 
+  await processRegularMessage(adapter, msg, text, hasAttachments);
+}
+
+/**
+ * Process a regular (non-command) message through the conversation engine.
+ * Extracted so it can be called from both handleMessage and forwardToAI.
+ */
+async function processRegularMessage(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  text: string,
+  hasAttachments?: boolean,
+): Promise<void> {
+  const { store } = getBridgeContext();
+
   // Regular message — route to conversation engine
   const binding = router.resolve(msg.address);
 
@@ -674,7 +689,13 @@ async function handleMessage(
 
   const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => {
     if (toolName) {
-      toolCallTracker.set(toolId, { id: toolId, name: toolName, status });
+      const existing = toolCallTracker.get(toolId);
+      toolCallTracker.set(toolId, {
+        id: toolId,
+        name: toolName,
+        status,
+        startedAt: existing?.startedAt ?? (status === 'running' ? Date.now() : undefined),
+      });
     } else {
       // tool_result doesn't carry name — update existing entry's status
       const existing = toolCallTracker.get(toolId);
@@ -695,7 +716,7 @@ async function handleMessage(
     // Pass permission callback so requests are forwarded to IM immediately
     // during streaming (the stream blocks until permission is resolved).
     // Use text or empty string for image-only messages (prompt is still required by streamClaude)
-    const promptText = text || (hasAttachments ? 'Describe this image.' : '');
+    const promptText = text || (hasAttachments ? '请分析这个文件的内容。' : '');
 
     const result = await engine.processMessage(binding, promptText, async (perm) => {
       await broker.forwardPermissionRequest(
@@ -822,10 +843,26 @@ async function handleMessage(
     state.activeTasks.delete(binding.codepilotSessionId);
     // Notify adapter that message processing ended
     adapter.onMessageEnd?.(msg.address.chatId);
-    // Commit the offset only after full processing (success or failure)
-    ack();
   }
 }
+
+/**
+ * Forward a slash command to the AI CLI as a regular message.
+ * Acquires session lock and processes through the conversation engine.
+ */
+async function forwardToAI(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+  promptText: string,
+): Promise<void> {
+  const binding = router.resolve(msg.address);
+  await processWithSessionLock(binding.codepilotSessionId, () =>
+    processRegularMessage(adapter, msg, promptText),
+  );
+}
+
+/** Commands that forward their args to the AI CLI. */
+const FORWARD_COMMANDS = new Set(['/ask', '/run', '/code']);
 
 /**
  * Handle IM slash commands.
@@ -862,6 +899,21 @@ async function handleCommand(
     return;
   }
 
+  // ── Forward commands to AI CLI ──
+  if (FORWARD_COMMANDS.has(command)) {
+    if (!args) {
+      await deliver(adapter, {
+        address: msg.address,
+        text: `Usage: ${command} <your message>`,
+        parseMode: 'plain',
+        replyToMessageId: msg.messageId,
+      });
+      return;
+    }
+    await forwardToAI(adapter, msg, args);
+    return;
+  }
+
   let response = '';
 
   switch (command) {
@@ -872,6 +924,9 @@ async function handleCommand(
         'Send any message to interact with Claude.',
         '',
         '<b>Commands:</b>',
+        '/ask &lt;message&gt; - Ask AI a question',
+        '/run &lt;description&gt; - Ask AI to run a command',
+        '/code &lt;task&gt; - Ask AI to write code',
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
@@ -1019,6 +1074,12 @@ async function handleCommand(
       response = [
         '<b>CodePilot Bridge Commands</b>',
         '',
+        '<b>AI Commands:</b>',
+        '/ask &lt;message&gt; - Ask AI a question',
+        '/run &lt;description&gt; - Ask AI to run a command',
+        '/code &lt;task&gt; - Ask AI to write code',
+        '',
+        '<b>Session Commands:</b>',
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
@@ -1032,8 +1093,15 @@ async function handleCommand(
       ].join('\n');
       break;
 
-    default:
+    default: {
+      const forwardUnknown = store.getSetting('bridge_forward_unknown_commands') !== 'false';
+      if (forwardUnknown) {
+        // Forward the entire command text as a prompt to the AI CLI
+        await forwardToAI(adapter, msg, text);
+        return;
+      }
       response = `Unknown command: ${escapeHtml(command)}\nType /help for available commands.`;
+    }
   }
 
   if (response) {

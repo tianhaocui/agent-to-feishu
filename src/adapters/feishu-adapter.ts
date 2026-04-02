@@ -2,6 +2,7 @@ import type { InboundMessage, OutboundMessage, PreviewCapabilities, SendResult }
 import { BaseChannelAdapter, registerAdapterFactory } from 'claude-to-im/src/lib/bridge/channel-adapter.js';
 import { getBridgeContext } from 'claude-to-im/src/lib/bridge/context.js';
 import { FeishuAdapter as UpstreamFeishuAdapter } from 'claude-to-im/src/lib/bridge/adapters/feishu-adapter.js';
+import { buildPairingApprovalCard } from 'claude-to-im/src/lib/bridge/markdown/feishu.js';
 import { getFeishuPairingStore } from '../feishu-pairing-store.js';
 
 function parseCsv(raw: string | null): string[] {
@@ -46,6 +47,11 @@ export class FeishuPairingAdapter extends BaseChannelAdapter {
       }
 
       if (message.callbackData) {
+        // Intercept pairing callbacks before they reach bridge-manager
+        if (message.callbackData.startsWith('pairing:')) {
+          await this.handlePairingCallback(message);
+          continue;
+        }
         return message;
       }
 
@@ -127,6 +133,40 @@ export class FeishuPairingAdapter extends BaseChannelAdapter {
     return this.inner.onStreamEnd ? this.inner.onStreamEnd(chatId, status, responseText) : Promise.resolve(false);
   }
 
+  async sendRawCard(chatId: string, cardJson: string): Promise<SendResult> {
+    return this.inner.sendRawCard(chatId, cardJson);
+  }
+
+  private async handlePairingCallback(message: InboundMessage): Promise<void> {
+    const parts = message.callbackData!.split(':');
+    const action = parts[1]; // 'approve' or 'reject'
+    const code = parts.slice(2).join(':');
+
+    if (action === 'approve') {
+      const record = this.pairingStore.approveByCode(code);
+      if (record) {
+        await this.inner.send(buildTextMessage(message.address,
+          `已批准 ${record.userId}，配对码 ${record.pairingCode}。`));
+        // Notify the user
+        if (record.latestChatId) {
+          const userAddress = { channelType: 'feishu' as const, chatId: record.latestChatId, userId: record.userId };
+          await this.inner.send(buildTextMessage(userAddress,
+            '你的配对已通过审批，现在可以开始使用了。发送任意消息开始对话。'));
+        }
+      } else {
+        await this.inner.send(buildTextMessage(message.address, `未找到配对码：${code}`));
+      }
+    } else if (action === 'reject') {
+      const record = this.pairingStore.rejectByCode(code);
+      if (record) {
+        await this.inner.send(buildTextMessage(message.address,
+          `已拒绝 ${record.userId}，配对码 ${record.pairingCode}。`));
+      } else {
+        await this.inner.send(buildTextMessage(message.address, `未找到配对码：${code}`));
+      }
+    }
+  }
+
   private isPairingEnabled(): boolean {
     return getBridgeContext().store.getSetting('bridge_feishu_pairing_enabled') === 'true';
   }
@@ -151,7 +191,7 @@ export class FeishuPairingAdapter extends BaseChannelAdapter {
     const userId = message.address.userId || '';
     if (!userId) return;
 
-    const record = this.pairingStore.upsertPending(
+    const { record, isNew } = this.pairingStore.upsertPending(
       userId,
       message.address.chatId,
       message.text.slice(0, 200),
@@ -164,6 +204,22 @@ export class FeishuPairingAdapter extends BaseChannelAdapter {
     ].join('\n');
 
     await this.inner.send(buildTextMessage(message.address, reply));
+
+    // Send approval card to admin chat (only for new pending records)
+    if (isNew) {
+      const adminChatId = getBridgeContext().store.getSetting('bridge_feishu_pairing_admin_chat_id');
+      if (adminChatId) {
+        const cardJson = buildPairingApprovalCard(
+          userId,
+          record.pairingCode,
+          message.text.slice(0, 200),
+          adminChatId,
+        );
+        await this.inner.sendRawCard(adminChatId, cardJson).catch((err: unknown) => {
+          console.warn('[feishu-pairing] Failed to send approval card:', err instanceof Error ? err.message : err);
+        });
+      }
+    }
   }
 
   private async handleAdminCommand(message: InboundMessage, text: string): Promise<boolean> {
