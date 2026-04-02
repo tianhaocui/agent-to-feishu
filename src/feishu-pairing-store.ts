@@ -63,6 +63,11 @@ function generateCode(): string {
   return out;
 }
 
+export interface UpsertResult {
+  record: PairingRecord;
+  isNew: boolean;
+}
+
 export class FeishuPairingStore {
   private read(): PairingFileShape {
     return readFileData();
@@ -80,9 +85,10 @@ export class FeishuPairingStore {
     return this.get(userId)?.status === 'approved';
   }
 
-  upsertPending(userId: string, chatId: string, messagePreview: string): PairingRecord {
+  upsertPending(userId: string, chatId: string, messagePreview: string): UpsertResult {
     const data = this.read();
     const existing = data.users[userId];
+    const isNew = !existing || existing.status !== 'pending';
     const timestamp = nowIso();
     const record: PairingRecord = {
       userId,
@@ -103,7 +109,7 @@ export class FeishuPairingStore {
 
     data.users[userId] = record;
     this.write(data);
-    return record;
+    return { record, isNew };
   }
 
   approveByCode(code: string): PairingRecord | null {

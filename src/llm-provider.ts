@@ -352,6 +352,15 @@ const SUPPORTED_IMAGE_TYPES = new Set<string>([
   'image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp',
 ]);
 
+const SUPPORTED_DOC_TYPES = new Set<string>([
+  'application/pdf',
+]);
+
+const TEXT_FILE_TYPES = new Set<string>([
+  'text/plain', 'text/html', 'text/xml', 'text/csv',
+  'application/json', 'application/xml',
+]);
+
 /**
  * Build a prompt for query(). When files are present, returns an async
  * iterable that yields a single SDKUserMessage with multi-modal content
@@ -361,8 +370,11 @@ function buildPrompt(
   text: string,
   files?: FileAttachment[],
 ): string | AsyncIterable<{ type: 'user'; message: { role: 'user'; content: unknown[] }; parent_tool_use_id: null; session_id: string }> {
-  const imageFiles = files?.filter(f => SUPPORTED_IMAGE_TYPES.has(f.type));
-  if (!imageFiles || imageFiles.length === 0) return text;
+  const imageFiles = files?.filter(f => SUPPORTED_IMAGE_TYPES.has(f.type)) ?? [];
+  const docFiles = files?.filter(f => SUPPORTED_DOC_TYPES.has(f.type)) ?? [];
+  const textFiles = files?.filter(f => TEXT_FILE_TYPES.has(f.type) || f.type === 'application/msword' || f.type === 'application/vnd.ms-excel') ?? [];
+
+  if (imageFiles.length === 0 && docFiles.length === 0 && textFiles.length === 0) return text;
 
   const contentBlocks: unknown[] = [];
 
@@ -375,6 +387,28 @@ function buildPrompt(
         data: file.data,
       },
     });
+  }
+
+  for (const file of docFiles) {
+    contentBlocks.push({
+      type: 'document',
+      source: {
+        type: 'base64',
+        media_type: file.type,
+        data: file.data,
+      },
+    });
+  }
+
+  // Text-based files: decode and inject as text content
+  for (const file of textFiles) {
+    try {
+      const decoded = Buffer.from(file.data, 'base64').toString('utf-8');
+      contentBlocks.push({
+        type: 'text',
+        text: `[文件: ${file.name}]\n${decoded}\n[/文件]`,
+      });
+    } catch { /* skip undecodable files */ }
   }
 
   if (text.trim()) {
@@ -602,9 +636,19 @@ export function handleMessage(
   controller: ReadableStreamDefaultController<string>,
   state: StreamState,
 ): void {
+  // Log all SDK message types for debugging thinking events
+  if (msg.type !== 'stream_event') {
+    console.log(`[llm-provider] msg.type: ${msg.type}`);
+  }
   switch (msg.type) {
     case 'stream_event': {
       const event = msg.event;
+      // Log all stream event types for debugging
+      if (event.type === 'content_block_delta') {
+        console.log(`[llm-provider] stream_event delta type: ${event.delta.type}`);
+      } else if (event.type === 'content_block_start') {
+        console.log(`[llm-provider] stream_event block_start type: ${event.content_block?.type}`);
+      }
       if (
         event.type === 'content_block_delta' &&
         event.delta.type === 'text_delta'
@@ -612,6 +656,13 @@ export function handleMessage(
         // Emit delta text — the bridge accumulates on its side
         controller.enqueue(sseEvent('text', event.delta.text));
         state.hasStreamedText = true;
+      }
+      if (
+        event.type === 'content_block_delta' &&
+        event.delta.type === 'thinking_delta'
+      ) {
+        // Emit thinking delta for real-time reasoning display
+        controller.enqueue(sseEvent('thinking', (event.delta as any).thinking));
       }
       if (
         event.type === 'content_block_start' &&

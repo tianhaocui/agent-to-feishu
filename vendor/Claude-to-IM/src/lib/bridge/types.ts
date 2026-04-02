@@ -174,6 +174,8 @@ export interface ToolCallInfo {
   id: string;
   name: string;
   status: 'running' | 'complete' | 'error';
+  /** Timestamp (ms) when the tool started running. */
+  startedAt?: number;
 }
 
 // ── Config ─────────────────────────────────────────────────────

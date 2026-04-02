@@ -1,20 +1,33 @@
-# CLAUDE.md — Project Guidelines for claude-to-im-skill
+# CLAUDE.md — Project Guidelines for agent-to-feishu
 
-## Replying to GitHub Issues
+## Overview
 
-When replying to user-reported issues, always include a **self-help prompt** at the end of the reply. Guide users to use their AI coding assistant (Claude Code / Codex) to diagnose and fix the problem themselves. Example:
+This is a Feishu-specific bridge that connects AI coding agents (Claude Code / Codex) to Feishu via WebSocket long connection. It is a fork of `claude-to-im` focused exclusively on Feishu.
 
-> **自助排查提示：** 你可以直接在 Claude Code（或 Codex）中发送以下提示，让 AI 帮你诊断问题：
->
-> ```
-> 请帮我排查 claude-to-im 桥接服务的问题。
-> 1. 读取 ~/.claude-to-im/logs/bridge.log 最近 50 行日志
-> 2. 读取 ~/.claude-to-im/config.env 检查配置是否正确
-> 3. 运行 bash ~/.claude/skills/claude-to-im/scripts/doctor.sh 并分析输出
-> 4. 根据日志和配置给出具体的修复建议
-> ```
+## Architecture
 
-This approach:
-- Reduces maintainer burden by enabling users to self-diagnose
-- Leverages the fact that users already have an AI coding assistant installed
-- Provides actionable next steps rather than just error explanations
+- `src/` — host application (main, config, store, LLM providers, pairing adapter)
+- `vendor/Claude-to-IM/` — vendored core bridge library (adapters, streaming, delivery, card builders)
+- After modifying vendor source, rebuild with: `cd vendor/Claude-to-IM && npm run build`
+- Then rebuild main: `npm run build`
+
+## Key Design Decisions
+
+- Feishu adapter uses WSClient long connection (no webhook/public IP needed)
+- CardKit v1 streaming cards for real-time AI response display
+- Pairing approval gate in `src/adapters/feishu-adapter.ts` wraps the upstream adapter
+- Permission cards use `card.action.trigger` callbacks via monkey-patched WSClient
+- Slash commands `/ask`, `/run`, `/code` forward to AI CLI; unknown commands also forwarded by default
+- Thinking/reasoning events from Claude SDK are streamed in real-time to cards
+
+## Build & Run
+
+```bash
+npm install
+npm run build
+CTI_HOME=~/.claude-to-im bash scripts/daemon.sh start
+```
+
+## Config
+
+All config in `~/.claude-to-im/config.env`. See `config.env.example` for all options.

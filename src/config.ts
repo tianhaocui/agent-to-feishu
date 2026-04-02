@@ -17,6 +17,9 @@ export interface Config {
   feishuPairingAdminUsers?: string[];
   feishuPairingAutoApproveUsers?: string[];
   feishuPairingRequireDirectMessage?: boolean;
+  feishuPairingAdminChatId?: string;
+  // Forward unrecognized slash commands to AI CLI as prompts
+  forwardUnknownCommands?: boolean;
   // Auto-approve all tool permission requests without user confirmation
   autoApprove?: boolean;
 }
@@ -81,6 +84,10 @@ export function loadConfig(): Config {
     feishuPairingRequireDirectMessage: env.has("CTI_FEISHU_PAIRING_REQUIRE_DIRECT_MESSAGE")
       ? env.get("CTI_FEISHU_PAIRING_REQUIRE_DIRECT_MESSAGE") === "true"
       : undefined,
+    feishuPairingAdminChatId: env.get("CTI_FEISHU_PAIRING_ADMIN_CHAT_ID") || undefined,
+    forwardUnknownCommands: env.has("CTI_FORWARD_UNKNOWN_COMMANDS")
+      ? env.get("CTI_FORWARD_UNKNOWN_COMMANDS") !== "false"
+      : true,
     autoApprove: env.get("CTI_AUTO_APPROVE") === "true",
   };
 }
@@ -163,6 +170,10 @@ export function configToSettings(config: Config): Map<string, string> {
       "bridge_feishu_pairing_require_direct_message",
       String(config.feishuPairingRequireDirectMessage)
     );
+  if (config.feishuPairingAdminChatId)
+    m.set("bridge_feishu_pairing_admin_chat_id", config.feishuPairingAdminChatId);
+  if (config.forwardUnknownCommands !== undefined)
+    m.set("bridge_forward_unknown_commands", String(config.forwardUnknownCommands));
 
   // ── Defaults ──
   m.set("bridge_default_work_dir", config.defaultWorkDir);

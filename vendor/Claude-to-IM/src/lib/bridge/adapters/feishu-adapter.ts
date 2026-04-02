@@ -36,6 +36,7 @@ import {
   buildPermissionButtonCard,
   formatElapsed,
   optimizeMarkdownStyle,
+  buildToolProgressMarkdown,
   splitReasoningText,
   stripReasoningTags,
 } from '../markdown/feishu.js';
@@ -105,6 +106,8 @@ interface StreamingCardState {
   accumulatedReasoningText: string;
   // Sub-controllers
   flush: FlushController;
+  /** Periodic timer to refresh tool elapsed time display. */
+  toolHeartbeat: ReturnType<typeof setInterval> | null;
   /** Whether the message was detected as unavailable (recalled/deleted). */
   terminated: boolean;
 }
@@ -125,6 +128,7 @@ type FeishuMessageEventData = {
   };
   message: {
     message_id: string;
+    parent_id?: string;
     chat_id: string;
     chat_type: string;
     message_type: string;
@@ -265,6 +269,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // Clean up active cards
     for (const [, state] of this.activeCards) {
+      if (state.toolHeartbeat) { clearInterval(state.toolHeartbeat); state.toolHeartbeat = null; }
       state.flush.cancelPendingFlush();
       state.flush.complete();
     }
@@ -467,6 +472,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       isReasoningPhase: false,
       accumulatedReasoningText: '',
       flush: null as any, // set below
+      toolHeartbeat: null,
       terminated: false,
     };
 
@@ -562,6 +568,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     try {
       const displayText = this.buildDisplayText(state);
       const resolvedText = optimizeMarkdownStyle(displayText);
+      console.log(`[feishu-adapter] Flush: phase=${state.phase}, len=${resolvedText.length}, reasoning=${state.isReasoningPhase}`);
 
       if (state.cardId) {
         // CardKit streaming — typewriter effect
@@ -600,15 +607,24 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  /** Build display text from state for streaming updates. */
+  /** Build display text from state for streaming updates, including tool progress. */
   private buildDisplayText(state: StreamingCardState): string {
+    let content: string;
     if (state.isReasoningPhase && state.accumulatedReasoningText) {
       const reasoningDisplay = `💭 **Thinking...**\n\n${state.accumulatedReasoningText}`;
-      return state.accumulatedText
+      content = state.accumulatedText
         ? state.accumulatedText + '\n\n' + reasoningDisplay
         : reasoningDisplay;
+    } else {
+      content = state.accumulatedText || '💭 Thinking...';
     }
-    return state.accumulatedText || '💭 Thinking...';
+
+    // Append tool progress with elapsed time
+    const toolMd = buildToolProgressMarkdown(state.toolCalls);
+    if (toolMd) {
+      content = content + '\n\n' + toolMd;
+    }
+    return content;
   }
 
   /**
@@ -621,10 +637,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // Track reasoning state
     const split = splitReasoningText(text);
     if (split.reasoningText && !split.answerText) {
-      // Pure reasoning payload
+      // Pure reasoning payload — show thinking content in real-time
       if (!state.reasoningStartTime) state.reasoningStartTime = Date.now();
       state.isReasoningPhase = true;
       state.accumulatedReasoningText = split.reasoningText;
+      console.log(`[feishu-adapter] Reasoning update: ${split.reasoningText.length} chars`);
       void state.flush.throttledUpdate(
         state.cardId ? THROTTLE_CONSTANTS.CARDKIT_MS : THROTTLE_CONSTANTS.PATCH_MS,
       );
@@ -665,6 +682,24 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const state = this.activeCards.get(chatId);
     if (!state) return;
     state.toolCalls = tools;
+
+    const hasRunning = tools.some(tc => tc.status === 'running');
+    if (hasRunning && !state.toolHeartbeat) {
+      // Start periodic flush to keep elapsed time updated (every 1s)
+      state.toolHeartbeat = setInterval(() => {
+        if (TERMINAL_PHASES.has(state.phase) || state.terminated) {
+          if (state.toolHeartbeat) { clearInterval(state.toolHeartbeat); state.toolHeartbeat = null; }
+          return;
+        }
+        void state.flush.throttledUpdate(
+          state.cardId ? THROTTLE_CONSTANTS.CARDKIT_MS : THROTTLE_CONSTANTS.PATCH_MS,
+        );
+      }, 1_000);
+    } else if (!hasRunning && state.toolHeartbeat) {
+      clearInterval(state.toolHeartbeat);
+      state.toolHeartbeat = null;
+    }
+
     void state.flush.throttledUpdate(
       state.cardId ? THROTTLE_CONSTANTS.CARDKIT_MS : THROTTLE_CONSTANTS.PATCH_MS,
     );
@@ -729,6 +764,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       console.warn('[feishu-adapter] Card finalize failed:', err instanceof Error ? err.message : err);
       return false;
     } finally {
+      if (state.toolHeartbeat) { clearInterval(state.toolHeartbeat); state.toolHeartbeat = null; }
       this.activeCards.delete(chatId);
     }
   }
@@ -740,6 +776,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.cardCreatePromises.delete(chatId);
     const state = this.activeCards.get(chatId);
     if (!state) return;
+    if (state.toolHeartbeat) { clearInterval(state.toolHeartbeat); state.toolHeartbeat = null; }
     state.flush.cancelPendingFlush();
     state.flush.complete();
     this.activeCards.delete(chatId);
@@ -1024,6 +1061,35 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
+  // ── Raw card send ──────────────────────────────────────────
+
+  /**
+   * Send a raw interactive card JSON to a chat.
+   * Used by the pairing adapter for approval cards.
+   */
+  async sendRawCard(chatId: string, cardJson: string): Promise<SendResult> {
+    if (!this.restClient) {
+      return { ok: false, error: 'Feishu client not initialized' };
+    }
+    try {
+      const receiveIdType = chatId.startsWith('ou_') ? 'open_id' : 'chat_id';
+      const res = await this.restClient.im.message.create({
+        params: { receive_id_type: receiveIdType },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: cardJson,
+        },
+      });
+      if (res?.data?.message_id) {
+        return { ok: true, messageId: res.data.message_id };
+      }
+      return { ok: false, error: res?.msg || 'Card send failed' };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Card send failed' };
+    }
+  }
+
   // ── Config & Auth ───────────────────────────────────────────
 
   validateConfig(): string | null {
@@ -1179,11 +1245,31 @@ export class FeishuAdapter extends BaseChannelAdapter {
       // [P2] Support file/audio/video/media downloads
       const fileKey = this.extractFileKey(msg.content);
       if (fileKey) {
+        // Try to extract original filename from content JSON
+        let fileName: string | undefined;
+        try {
+          const parsed = JSON.parse(msg.content);
+          fileName = parsed.file_name || parsed.fileName || undefined;
+        } catch { /* ignore */ }
+
         const resourceType = messageType === 'audio' || messageType === 'video' || messageType === 'media'
           ? messageType
           : 'file';
         const attachment = await this.downloadResource(msg.message_id, fileKey, resourceType);
         if (attachment) {
+          // Override name and MIME if we have the original filename
+          if (fileName) {
+            attachment.name = fileName;
+            const ext = fileName.split('.').pop()?.toLowerCase();
+            if (ext === 'pdf') attachment.type = 'application/pdf';
+            else if (ext === 'txt' || ext === 'md' || ext === 'csv' || ext === 'log') attachment.type = 'text/plain';
+            else if (ext === 'json') attachment.type = 'application/json';
+            else if (ext === 'html' || ext === 'htm') attachment.type = 'text/html';
+            else if (ext === 'xml') attachment.type = 'text/xml';
+            else if (ext === 'py' || ext === 'js' || ext === 'ts' || ext === 'java' || ext === 'go' || ext === 'rs' || ext === 'c' || ext === 'cpp' || ext === 'rb' || ext === 'sh') attachment.type = 'text/plain';
+            else if (ext === 'doc' || ext === 'docx') attachment.type = 'application/msword';
+            else if (ext === 'xls' || ext === 'xlsx') attachment.type = 'application/vnd.ms-excel';
+          }
           attachments.push(attachment);
         } else {
           text = `[${messageType} download failed]`;
@@ -1217,6 +1303,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // Strip @mention markers from text
     text = this.stripMentionMarkers(text);
+
+    // Fetch quoted message content if this is a reply
+    if (msg.parent_id) {
+      const quotedText = await this.fetchQuotedMessage(msg.parent_id);
+      if (quotedText) {
+        text = `[引用消息]\n${quotedText}\n[/引用消息]\n\n${text}`;
+      }
+    }
 
     if (!text.trim() && attachments.length === 0) return;
 
@@ -1275,6 +1369,32 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   // ── Content parsing ─────────────────────────────────────────
+
+  /**
+   * Fetch the content of a quoted/replied message via Feishu REST API.
+   * Returns the plain text of the quoted message, or null on failure.
+   */
+  private async fetchQuotedMessage(parentId: string): Promise<string | null> {
+    if (!this.restClient) return null;
+    try {
+      const res = await this.restClient.im.message.get({
+        path: { message_id: parentId },
+      });
+      const item = (res as any)?.data?.items?.[0];
+      if (!item?.body?.content) return null;
+      const msgType = item.msg_type || 'text';
+      if (msgType === 'text') {
+        return this.parseTextContent(item.body.content);
+      } else if (msgType === 'post') {
+        const { extractedText } = this.parsePostContent(item.body.content);
+        return extractedText || null;
+      }
+      return null;
+    } catch (err) {
+      console.warn('[feishu-adapter] Failed to fetch quoted message:', parentId, err);
+      return null;
+    }
+  }
 
   private parseTextContent(content: string): string {
     try {
