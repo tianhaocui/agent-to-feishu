@@ -1306,9 +1306,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // Fetch quoted message content if this is a reply
     if (msg.parent_id) {
-      const quotedText = await this.fetchQuotedMessage(msg.parent_id);
-      if (quotedText) {
-        text = `[引用消息]\n${quotedText}\n[/引用消息]\n\n${text}`;
+      const quoted = await this.fetchQuotedMessage(msg.parent_id);
+      if (quoted) {
+        if (quoted.text) {
+          text = `[引用消息]\n${quoted.text}\n[/引用消息]\n\n${text}`;
+        }
+        if (quoted.attachments) {
+          attachments.push(...quoted.attachments);
+        }
       }
     }
 
@@ -1372,9 +1377,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   /**
    * Fetch the content of a quoted/replied message via Feishu REST API.
-   * Returns the plain text of the quoted message, or null on failure.
+   * Returns text and/or attachments from the quoted message.
    */
-  private async fetchQuotedMessage(parentId: string): Promise<string | null> {
+  private async fetchQuotedMessage(parentId: string): Promise<{ text?: string; attachments?: FileAttachment[] } | null> {
     if (!this.restClient) return null;
     try {
       const res = await this.restClient.im.message.get({
@@ -1383,12 +1388,57 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const item = (res as any)?.data?.items?.[0];
       if (!item?.body?.content) return null;
       const msgType = item.msg_type || 'text';
+
       if (msgType === 'text') {
-        return this.parseTextContent(item.body.content);
-      } else if (msgType === 'post') {
-        const { extractedText } = this.parsePostContent(item.body.content);
-        return extractedText || null;
+        return { text: this.parseTextContent(item.body.content) || undefined };
       }
+
+      if (msgType === 'post') {
+        const { extractedText, imageKeys } = this.parsePostContent(item.body.content);
+        const atts: FileAttachment[] = [];
+        for (const key of imageKeys) {
+          const att = await this.downloadResource(item.message_id, key, 'image');
+          if (att) atts.push(att);
+        }
+        return { text: extractedText || undefined, attachments: atts.length > 0 ? atts : undefined };
+      }
+
+      if (msgType === 'image') {
+        const fileKey = this.extractFileKey(item.body.content);
+        if (fileKey) {
+          const att = await this.downloadResource(item.message_id, fileKey, 'image');
+          if (att) return { text: '[引用了一张图片]', attachments: [att] };
+        }
+        return { text: '[引用了一张图片，但下载失败]' };
+      }
+
+      if (msgType === 'file') {
+        const fileKey = this.extractFileKey(item.body.content);
+        if (fileKey) {
+          let fileName: string | undefined;
+          try {
+            const parsed = JSON.parse(item.body.content);
+            fileName = parsed.file_name || parsed.fileName || undefined;
+          } catch { /* ignore */ }
+          const att = await this.downloadResource(item.message_id, fileKey, 'file');
+          if (att) {
+            if (fileName) {
+              att.name = fileName;
+              const ext = fileName.split('.').pop()?.toLowerCase();
+              if (ext === 'pdf') att.type = 'application/pdf';
+              else if (ext === 'txt' || ext === 'md' || ext === 'csv' || ext === 'log') att.type = 'text/plain';
+              else if (ext === 'json') att.type = 'application/json';
+            }
+            return { text: `[引用了文件: ${att.name}]`, attachments: [att] };
+          }
+        }
+        return { text: '[引用了一个文件，但下载失败]' };
+      }
+
+      if (msgType === 'audio') return { text: '[引用了一条语音消息]' };
+      if (msgType === 'video') return { text: '[引用了一条视频消息]' };
+      if (msgType === 'media') return { text: '[引用了一条媒体消息]' };
+
       return null;
     } catch (err) {
       console.warn('[feishu-adapter] Failed to fetch quoted message:', parentId, err);
