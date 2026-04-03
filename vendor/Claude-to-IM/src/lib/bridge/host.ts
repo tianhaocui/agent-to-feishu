@@ -23,7 +23,7 @@ export interface FileAttachment {
 /** Server-Sent Event from the LLM stream. */
 export interface SSEEvent {
   type: SSEEventType;
-  data: string;
+  data: unknown;
 }
 
 export type SSEEventType =
@@ -74,6 +74,7 @@ export interface BridgeSession {
   model: string;
   system_prompt?: string;
   provider_id?: string;
+  sdk_session_id?: string;
 }
 
 /** Minimal message object returned by the store. */

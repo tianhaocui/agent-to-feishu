@@ -13,7 +13,11 @@ export class PendingPermissions {
     resolve: (r: PermissionResult) => void;
     timer: NodeJS.Timeout;
   }>();
-  private timeoutMs = 5 * 60 * 1000; // 5 minutes
+  private timeoutMs: number;
+
+  constructor(timeoutMs = 300_000) {
+    this.timeoutMs = timeoutMs;
+  }
 
   waitFor(toolUseID: string): Promise<PermissionResult> {
     return new Promise((resolve) => {

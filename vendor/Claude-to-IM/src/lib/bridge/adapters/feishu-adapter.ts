@@ -112,6 +112,11 @@ interface StreamingCardState {
   terminated: boolean;
 }
 
+/** Escape a string for use in a RegExp. */
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /** Abort text patterns for fast-path detection. */
 const ABORT_PATTERNS = /^(\/stop|stop|停止|取消|abort|cancel)$/i;
 
@@ -177,10 +182,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private knownBots = new Map<string, string>();
   /** Reverse lookup: openId -> name. */
   private knownBotsByOpenId = new Map<string, string>();
-  /** Bot-to-bot conversation depth per chatId. */
-  private botConversationDepth = new Map<string, number>();
-  /** Last bot-triggered response time per chatId. */
-  private lastBotResponseTime = new Map<string, number>();
+  /** Observed bots per group chat: chatId -> Set<botName>. */
+  private groupObservedBots = new Map<string, Set<string>>();
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -831,16 +834,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
-    this.lastBotResponseTime.set(chatId, Date.now());
     const result = await this.finalizeCard(chatId, status, responseText);
 
     // Multi-bot: relay mentions to peer bots via HTTP
     // Match both @[BotName] and @BotName (for known bots)
     const multiBotEnabled = getBridgeContext().store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
     if (multiBotEnabled && status === 'completed' && responseText) {
+      const { relayToBot, getRelayPeerNames } = await import('../bridge-manager.js');
       const relayedBots = new Set<string>();
 
-      // Collect all mentioned bot names
       // 1. @[BotName] format
       const bracketPattern = /@\[([^\]]+)\]/g;
       let match;
@@ -848,21 +850,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
         relayedBots.add(match[1]);
       }
       // 2. @BotName format — match against known bot names and relay peers
-      const { isRelayPeer } = await import('../bridge-manager.js');
-      const checkNames = new Set([...this.knownBots.keys()]);
-      // Add relay peer names from config (they may not be in knownBots yet)
-      const { store: ctxStore } = getBridgeContext();
-      const peersRaw = ctxStore.getSetting('bridge_relay_peers') || '';
-      for (const entry of peersRaw.split(',')) {
-        const parts = entry.split(':').map(s => s.trim());
-        if (parts.length >= 3) {
-          checkNames.add(parts.slice(0, parts.length - 2).join(':').toLowerCase());
-        }
-      }
+      const checkNames = new Set([...this.knownBots.keys(), ...getRelayPeerNames()]);
       for (const name of checkNames) {
         if (relayedBots.has(name)) continue;
-        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const pattern = new RegExp(`@${escaped}(?![\\w])`, 'gi');
+        const pattern = new RegExp(`@${escapeRegex(name)}(?![\\w])`, 'gi');
         if (pattern.test(responseText)) {
           relayedBots.add(name);
         }
@@ -871,15 +862,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const myName = this.knownBotsByOpenId.get(this.botOpenId || '') || 'unknown';
 
       for (const botName of relayedBots) {
-        // Extract context: find the mention and take text after it
-        const idx = responseText.toLowerCase().indexOf(`@${botName.toLowerCase()}`);
-        const afterIdx = idx >= 0 ? responseText.indexOf(' ', idx + botName.length + 1) : -1;
-        const context = afterIdx >= 0 ? responseText.slice(afterIdx).trim().slice(0, 500) : '';
-        const relayText = context || responseText.slice(0, 500);
-
         try {
-          const { relayToBot } = await import('../bridge-manager.js');
-          const sent = await relayToBot(botName, chatId, relayText, myName);
+          const sent = await relayToBot(botName, chatId, responseText, myName);
           if (sent) {
             console.log(`[feishu-adapter] Relayed to ${botName} via HTTP`);
           } else {
@@ -1257,6 +1241,24 @@ export class FeishuAdapter extends BaseChannelAdapter {
       || '';
     const isGroup = msg.chat_type === 'group';
 
+    // Track bots observed in this group chat
+    if (isGroup) {
+      if (isBotSender) {
+        const senderBotName = this.knownBotsByOpenId.get(userId);
+        if (senderBotName) this.recordBotInGroup(chatId, senderBotName);
+      }
+      if (msg.mentions) {
+        for (const m of msg.mentions) {
+          const openId = m.id.open_id || '';
+          if (!openId) continue;
+          const botName = this.knownBotsByOpenId.get(openId);
+          if (botName && !this.botIds.has(openId)) {
+            this.recordBotInGroup(chatId, botName);
+          }
+        }
+      }
+    }
+
     // Authorization check
     if (!this.isAuthorized(userId, chatId)) {
       console.warn('[feishu-adapter] Unauthorized message from userId:', userId, 'chatId:', chatId);
@@ -1406,6 +1408,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
         }
         // Don't add fallback text for individual post images — the text already carries context
       }
+    } else if (messageType === 'interactive') {
+      // Card message — recursively extract text from card elements
+      text = this.parseCardContent(msg.content);
+      if (!text) {
+        console.log(`[feishu-adapter] Card message with no extractable text, msgId: ${msg.message_id}`);
+        return;
+      }
     } else {
       // Unsupported type — log and skip
       console.log(`[feishu-adapter] Unsupported message type: ${messageType}, msgId: ${msg.message_id}`);
@@ -1453,11 +1462,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
           text: trimmedText,
           timestamp,
           callbackData,
+          isGroup,
         };
         this.enqueue(inbound);
         return;
       }
     }
+
+    const groupBotNames = isGroup ? this.getGroupBotNames(chatId) : undefined;
 
     const inbound: InboundMessage = {
       messageId: msg.message_id,
@@ -1468,6 +1480,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
       senderType: isBotSender ? 'bot' : 'user',
       senderName: isBotSender ? (this.knownBotsByOpenId.get(userId) || userId) : undefined,
       contextOnly: contextOnly || undefined,
+      isGroup,
+      groupBotNames: groupBotNames && groupBotNames.length > 0 ? groupBotNames : undefined,
     };
 
     // Audit log
@@ -1549,6 +1563,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
         return { text: '[引用了一个文件，但下载失败]' };
       }
 
+      if (msgType === 'interactive') {
+        const cardText = this.parseCardContent(item.body.content);
+        return { text: cardText || '[引用了一条卡片消息]' };
+      }
+
       if (msgType === 'audio') return { text: '[引用了一条语音消息]' };
       if (msgType === 'video') return { text: '[引用了一条视频消息]' };
       if (msgType === 'media') return { text: '[引用了一条媒体消息]' };
@@ -1620,6 +1639,97 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     return { extractedText: textParts.join('').trim(), imageKeys };
+  }
+
+  /**
+   * Parse card (interactive) message content, recursively extracting text
+   * from all element types including nested containers.
+   */
+  private parseCardContent(content: string): string {
+    try {
+      const parsed = JSON.parse(content);
+      const parts: string[] = [];
+
+      // Card header title
+      const header = parsed.header;
+      if (header?.title?.content) {
+        parts.push(header.title.content);
+      }
+
+      // Template card: data.template_variable may contain text fields
+      if (parsed.type === 'template' && parsed.data?.template_variable) {
+        const vars = parsed.data.template_variable;
+        for (const val of Object.values(vars)) {
+          if (typeof val === 'string' && val.trim()) {
+            parts.push(val);
+          }
+        }
+      }
+
+      // Body elements (CardKit v1 / v2)
+      const elements = parsed.body?.elements || parsed.elements || [];
+      this.extractCardElements(elements, parts);
+
+      return parts.join('\n').trim();
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Recursively extract text from card element tree.
+   */
+  private extractCardElements(elements: any[], parts: string[]): void {
+    if (!Array.isArray(elements)) return;
+
+    for (const el of elements) {
+      if (!el || typeof el !== 'object') continue;
+      const tag = el.tag;
+
+      // Direct text content
+      if (tag === 'markdown' || tag === 'plain_text' || tag === 'lark_md') {
+        if (el.content) parts.push(el.content);
+      } else if (tag === 'div') {
+        // div can have text field or nested fields
+        if (el.text?.content) parts.push(el.text.content);
+        if (el.fields) {
+          for (const f of el.fields) {
+            if (f?.text?.content) parts.push(f.text.content);
+          }
+        }
+      } else if (tag === 'rich_text') {
+        if (el.content) parts.push(el.content);
+      } else if (tag === 'note') {
+        // Note element has an elements array
+        if (Array.isArray(el.elements)) {
+          for (const ne of el.elements) {
+            if (ne?.content) parts.push(ne.content);
+            if (ne?.text?.content) parts.push(ne.text.content);
+          }
+        }
+      }
+
+      // Containers — recurse into children
+      if (tag === 'collapsible_panel') {
+        // Header text
+        if (el.header?.title?.content) parts.push(el.header.title.content);
+        this.extractCardElements(el.elements || el.body?.elements || [], parts);
+      } else if (tag === 'column_set') {
+        for (const col of el.columns || []) {
+          this.extractCardElements(col.elements || [], parts);
+        }
+      } else if (tag === 'form') {
+        this.extractCardElements(el.elements || [], parts);
+      } else if (tag === 'interactive_container' || tag === 'card_link') {
+        this.extractCardElements(el.elements || [], parts);
+      }
+
+      // Generic fallback: if element has nested elements we haven't handled
+      if (el.elements && !['collapsible_panel', 'column_set', 'form', 'note',
+          'interactive_container', 'card_link'].includes(tag)) {
+        this.extractCardElements(el.elements, parts);
+      }
+    }
   }
 
   // ── Bot identity ────────────────────────────────────────────
@@ -1695,6 +1805,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
+  /**
+   * Record a bot as observed in a group chat.
+   * Called when we see a bot message or a bot @mention in a group.
+   */
+  recordBotInGroup(chatId: string, botName: string): void {
+    let bots = this.groupObservedBots.get(chatId);
+    if (!bots) {
+      bots = new Set();
+      this.groupObservedBots.set(chatId, bots);
+    }
+    bots.add(botName);
+  }
+
+  /**
+   * Get bot names observed in a group chat.
+   * Falls back to empty array if no bots have been seen yet.
+   */
+  getGroupBotNames(chatId: string): string[] {
+    const bots = this.groupObservedBots.get(chatId);
+    return bots ? Array.from(bots) : [];
+  }
+
   /** Auto-discover bots from message mentions. */
   private registerBotFromMentions(
     mentions?: FeishuMessageEventData['message']['mentions'],
@@ -1741,10 +1873,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const isSelf = ids.some(id => this.botIds.has(id));
       if (isSelf) {
         // Strip self-mention
-        text = text.replace(new RegExp(m.key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '');
+        text = text.replace(new RegExp(escapeRegex(m.key), 'g'), '');
       } else {
         // Replace with @Name for context
-        text = text.replace(new RegExp(m.key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), `@${m.name}`);
+        text = text.replace(new RegExp(escapeRegex(m.key), 'g'), `@${m.name}`);
         // Auto-discover other bots from mentions
         const openId = m.id.open_id;
         if (openId && !this.knownBots.has(m.name.toLowerCase())) {
@@ -1771,7 +1903,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     });
     // Second: @BotName format (known bots only, avoid false positives)
     for (const [name, openId] of this.knownBots) {
-      const pattern = new RegExp(`@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w\\[])`, 'gi');
+      const pattern = new RegExp(`@${escapeRegex(name)}(?![\\w\\[])`, 'gi');
       const replacement = format === 'card'
         ? `<at id=${openId}></at>`
         : `<at user_id="${openId}">${name}</at>`;

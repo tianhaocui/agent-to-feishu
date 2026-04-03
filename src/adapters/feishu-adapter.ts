@@ -24,7 +24,7 @@ export class FeishuPairingAdapter extends BaseChannelAdapter {
   readonly channelType = 'feishu' as const;
 
   get botName(): string | null | undefined {
-    return (this.inner as any).botName;
+    return this.inner.botName;
   }
   private readonly inner = new UpstreamFeishuAdapter();
   private readonly pairingStore = getFeishuPairingStore();
@@ -138,7 +138,7 @@ export class FeishuPairingAdapter extends BaseChannelAdapter {
   }
 
   injectMessage(msg: InboundMessage): void {
-    (this.inner as any).injectMessage(msg);
+    this.inner.injectMessage?.(msg);
   }
 
   async sendRawCard(chatId: string, cardJson: string): Promise<SendResult> {

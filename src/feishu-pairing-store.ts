@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 
 import { CTI_HOME } from './config.js';
@@ -58,7 +59,7 @@ function writeFileData(data: PairingFileShape): void {
 function generateCode(): string {
   let out = '';
   for (let i = 0; i < 6; i += 1) {
-    out += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    out += CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)];
   }
   return out;
 }
@@ -69,16 +70,18 @@ export interface UpsertResult {
 }
 
 export class FeishuPairingStore {
-  private read(): PairingFileShape {
-    return readFileData();
+  private data: PairingFileShape;
+
+  constructor() {
+    this.data = readFileData();
   }
 
-  private write(data: PairingFileShape): void {
-    writeFileData(data);
+  private persist(): void {
+    writeFileData(this.data);
   }
 
   get(userId: string): PairingRecord | null {
-    return this.read().users[userId] ?? null;
+    return this.data.users[userId] ?? null;
   }
 
   isApproved(userId: string): boolean {
@@ -86,8 +89,7 @@ export class FeishuPairingStore {
   }
 
   upsertPending(userId: string, chatId: string, messagePreview: string): UpsertResult {
-    const data = this.read();
-    const existing = data.users[userId];
+    const existing = this.data.users[userId];
     const isNew = !existing || existing.status !== 'pending';
     const timestamp = nowIso();
     const record: PairingRecord = {
@@ -107,15 +109,14 @@ export class FeishuPairingStore {
       record.approvedAt = undefined;
     }
 
-    data.users[userId] = record;
-    this.write(data);
+    this.data.users[userId] = record;
+    this.persist();
     return { record, isNew };
   }
 
   approveByCode(code: string): PairingRecord | null {
-    const data = this.read();
     const normalized = code.trim().toUpperCase();
-    const entry = Object.entries(data.users).find(([, record]) => record.pairingCode === normalized);
+    const entry = Object.entries(this.data.users).find(([, record]) => record.pairingCode === normalized);
     if (!entry) return null;
 
     const [userId, record] = entry;
@@ -125,15 +126,14 @@ export class FeishuPairingStore {
       approvedAt: nowIso(),
       rejectedAt: undefined,
     };
-    data.users[userId] = updated;
-    this.write(data);
+    this.data.users[userId] = updated;
+    this.persist();
     return updated;
   }
 
   rejectByCode(code: string): PairingRecord | null {
-    const data = this.read();
     const normalized = code.trim().toUpperCase();
-    const entry = Object.entries(data.users).find(([, record]) => record.pairingCode === normalized);
+    const entry = Object.entries(this.data.users).find(([, record]) => record.pairingCode === normalized);
     if (!entry) return null;
 
     const [userId, record] = entry;
@@ -142,13 +142,13 @@ export class FeishuPairingStore {
       status: 'rejected',
       rejectedAt: nowIso(),
     };
-    data.users[userId] = updated;
-    this.write(data);
+    this.data.users[userId] = updated;
+    this.persist();
     return updated;
   }
 
   list(status?: PairingStatus): PairingRecord[] {
-    const records = Object.values(this.read().users).sort((a, b) =>
+    const records = Object.values(this.data.users).sort((a, b) =>
       a.firstRequestedAt.localeCompare(b.firstRequestedAt)
     );
     return status ? records.filter((record) => record.status === status) : records;
