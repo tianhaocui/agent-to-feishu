@@ -246,7 +246,7 @@ async function consumeStream(
 
         switch (event.type) {
           case 'thinking':
-            thinkingText += event.data;
+            thinkingText += event.data as string;
             if (onPartialText) {
               // Pass thinking + text combined; adapter uses <think> marker to fold
               const combined = thinkingText
@@ -257,9 +257,9 @@ async function consumeStream(
             break;
 
           case 'text':
-            currentText += event.data;
+            currentText += event.data as string;
             if (onPartialText) {
-              previewText += event.data;
+              previewText += event.data as string;
               const combined = thinkingText
                 ? `<think>\n${thinkingText}\n</think>\n\n${previewText}`
                 : previewText;
@@ -273,7 +273,7 @@ async function consumeStream(
               currentText = '';
             }
             try {
-              const toolData = JSON.parse(event.data);
+              const toolData = event.data as Record<string, unknown>;
               contentBlocks.push({
                 type: 'tool_use',
                 id: toolData.id,
@@ -281,7 +281,7 @@ async function consumeStream(
                 input: toolData.input,
               });
               if (onToolEvent) {
-                try { onToolEvent(toolData.id, toolData.name, 'running'); } catch { /* non-critical */ }
+                try { onToolEvent(toolData.id as string, toolData.name as string, 'running'); } catch { /* non-critical */ }
               }
             } catch { /* skip */ }
             break;
@@ -289,26 +289,26 @@ async function consumeStream(
 
           case 'tool_result': {
             try {
-              const resultData = JSON.parse(event.data);
+              const resultData = event.data as Record<string, unknown>;
               const newBlock = {
                 type: 'tool_result' as const,
                 tool_use_id: resultData.tool_use_id,
                 content: resultData.content,
                 is_error: resultData.is_error || false,
               };
-              if (seenToolResultIds.has(resultData.tool_use_id)) {
+              if (seenToolResultIds.has(resultData.tool_use_id as string)) {
                 const idx = contentBlocks.findIndex(
                   (b) => b.type === 'tool_result' && 'tool_use_id' in b && b.tool_use_id === resultData.tool_use_id
                 );
                 if (idx >= 0) contentBlocks[idx] = newBlock;
               } else {
-                seenToolResultIds.add(resultData.tool_use_id);
+                seenToolResultIds.add(resultData.tool_use_id as string);
                 contentBlocks.push(newBlock);
               }
               if (onToolEvent) {
                 try {
                   onToolEvent(
-                    resultData.tool_use_id,
+                    resultData.tool_use_id as string,
                     '', // name not available in tool_result, adapter tracks by id
                     resultData.is_error ? 'error' : 'complete',
                   );
@@ -320,12 +320,12 @@ async function consumeStream(
 
           case 'permission_request': {
             try {
-              const permData = JSON.parse(event.data);
+              const permData = event.data as Record<string, unknown>;
               const perm: PermissionRequestInfo = {
-                permissionRequestId: permData.permissionRequestId,
-                toolName: permData.toolName,
+                permissionRequestId: permData.permissionRequestId as string,
+                toolName: permData.toolName as string,
                 toolInput: permData.toolInput,
-                suggestions: permData.suggestions,
+                suggestions: permData.suggestions as string[] | undefined,
               };
               permissionRequests.push(perm);
               // Forward immediately — the stream blocks until the permission is
@@ -341,9 +341,9 @@ async function consumeStream(
 
           case 'ask_user_question': {
             try {
-              const questionData = JSON.parse(event.data);
+              const questionData = event.data as Record<string, unknown>;
               const question: AskUserQuestionInfo = {
-                questionId: questionData.questionId,
+                questionId: questionData.questionId as string,
                 toolInput: questionData.toolInput,
               };
               if (onAskUserQuestion) {
@@ -357,7 +357,7 @@ async function consumeStream(
 
           case 'status': {
             try {
-              const statusData = JSON.parse(event.data);
+              const statusData = event.data as Record<string, unknown>;
               if (statusData.session_id) {
                 capturedSdkSessionId = statusData.session_id;
                 store.updateSdkSessionId(sessionId, statusData.session_id);
@@ -371,7 +371,7 @@ async function consumeStream(
 
           case 'task_update': {
             try {
-              const taskData = JSON.parse(event.data);
+              const taskData = event.data as Record<string, unknown>;
               if (taskData.session_id && taskData.todos) {
                 store.syncSdkTasks(taskData.session_id, taskData.todos);
               }
@@ -381,12 +381,12 @@ async function consumeStream(
 
           case 'error':
             hasError = true;
-            errorMessage = event.data || 'Unknown error';
+            errorMessage = (event.data as string) || 'Unknown error';
             break;
 
           case 'result': {
             try {
-              const resultData = JSON.parse(event.data);
+              const resultData = event.data as Record<string, unknown>;
               if (resultData.usage) tokenUsage = resultData.usage;
               if (resultData.is_error) hasError = true;
               if (resultData.session_id) {

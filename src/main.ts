@@ -124,7 +124,8 @@ async function main(): Promise<void> {
 
   const settings = configToSettings(config);
   const store = new JsonFileStore(settings);
-  const pendingPerms = new PendingPermissions();
+  const permTimeoutSecs = parseInt(process.env.CTI_PERMISSION_TIMEOUT_SECS || '300', 10) || 300;
+  const pendingPerms = new PendingPermissions(permTimeoutSecs * 1000);
   const llm = await resolveProvider(config, pendingPerms);
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
 
@@ -160,6 +161,11 @@ async function main(): Promise<void> {
 
   await bridgeManager.start();
 
+  // Periodic cleanup of expired dedup keys
+  const dedupCleanupInterval = setInterval(() => {
+    store.cleanupExpiredDedup();
+  }, 60_000);
+
   // Graceful shutdown
   let shuttingDown = false;
   const shutdown = async (signal?: string) => {
@@ -167,6 +173,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     const reason = signal ? `signal: ${signal}` : 'shutdown requested';
     console.log(`[claude-to-im] Shutting down (${reason})...`);
+    clearInterval(dedupCleanupInterval);
     pendingPerms.denyAll();
     await bridgeManager.stop();
     writeStatus({ running: false, lastExitReason: reason });

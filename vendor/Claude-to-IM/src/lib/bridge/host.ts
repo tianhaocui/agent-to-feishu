@@ -23,7 +23,7 @@ export interface FileAttachment {
 /** Server-Sent Event from the LLM stream. */
 export interface SSEEvent {
   type: SSEEventType;
-  data: string;
+  data: unknown;
 }
 
 export type SSEEventType =

@@ -6,6 +6,5 @@
  */
 
 export function sseEvent(type: string, data: unknown): string {
-  const payload = typeof data === 'string' ? data : JSON.stringify(data);
-  return `data: ${JSON.stringify({ type, data: payload })}\n`;
+  return `data: ${JSON.stringify({ type, data })}\n`;
 }
