@@ -21,11 +21,16 @@ The daemon connects to Feishu via WebSocket (no public IP needed), receives mess
 - **Feishu-native** — WebSocket long connection, CardKit v1 streaming cards, interactive buttons
 - **Real-time streaming** — AI responses stream into Feishu cards with typewriter effect
 - **Thinking display** — extended thinking content shown in real-time, collapsed in final card
-- **Tool progress** — running tools show elapsed time (`🔄 Bash (15s)`), auto-refreshed every 5s
-- **Permission control** — tool calls require approval via card buttons or quick `1/2/3` replies
+- **Tool progress** — running tools show elapsed time (`🔄 Bash (15s)`), auto-refreshed every second
+- **Permission control** — tool calls require approval via card buttons or quick `1/2/3` replies, with configurable timeout
 - **Pairing approval** — unknown users get a pairing code; admins approve via interactive card buttons
+- **Quoted replies** — replying to a Feishu message automatically fetches the quoted content (text, images, files) as context
+- **Multi-modal input** — send images, files (PDF, code files, etc.) to the AI, up to 20MB
+- **Multi-bot collaboration** — multiple AI bots in a group chat can @mention each other, with depth limits and cooldown
+- **MCP servers & Skills** — auto-loads MCP servers from `~/.claude/settings.json` and skills from `~/.claude/skills/`
 - **Slash commands** — `/ask`, `/run`, `/code` forward to AI; unknown commands also forwarded by default
 - **Dual runtime** — Claude Code CLI or Codex SDK, switchable via config
+- **Third-party API** — supports third-party API providers via `ANTHROPIC_BASE_URL`
 - **Session persistence** — conversations survive daemon restarts with automatic session resume
 
 ## Prerequisites
@@ -61,6 +66,16 @@ CTI_DEFAULT_WORKDIR=/path/to/project
 CTI_FEISHU_APP_ID=cli_xxx
 CTI_FEISHU_APP_SECRET=xxx
 CTI_FEISHU_DOMAIN=feishu.cn
+
+# Optional: third-party API provider
+# ANTHROPIC_API_KEY=your-key
+# ANTHROPIC_BASE_URL=https://your-provider.com/v1
+
+# Optional: auto-approve all tool permissions (trusted environments only)
+# CTI_AUTO_APPROVE=true
+
+# Optional: permission request timeout in seconds (default: 300)
+# CTI_PERMISSION_TIMEOUT_SECS=300
 ```
 
 ### 3. Build & Start
@@ -94,6 +109,23 @@ Commands available inside Feishu chat:
 
 Unknown `/commands` are forwarded to the AI by default (configurable via `CTI_FORWARD_UNKNOWN_COMMANDS`).
 
+## Multi-Bot Collaboration
+
+Enable multi-bot collaboration in group chats so multiple AI bots can converse with each other:
+
+1. When an AI response contains `@[BotName]`, it's converted to a Feishu @mention and relayed to the target bot via HTTP
+2. Depth limit (`CTI_FEISHU_BOT_MAX_DEPTH`) prevents infinite conversation loops
+3. Cooldown (`CTI_FEISHU_BOT_COOLDOWN_MS`) controls response frequency
+
+Config:
+
+```env
+CTI_FEISHU_MULTI_BOT_ENABLED=true
+CTI_FEISHU_KNOWN_BOTS=BotA:ou_xxx,BotB:ou_yyy
+CTI_FEISHU_BOT_MAX_DEPTH=3          # max conversation depth (default: 3)
+CTI_FEISHU_BOT_COOLDOWN_MS=5000     # cooldown in ms (default: 5000)
+```
+
 ## Pairing Approval
 
 When `CTI_FEISHU_PAIRING_ENABLED=true`, unknown users cannot access the AI until approved:
@@ -119,7 +151,7 @@ CTI_FEISHU_PAIRING_AUTO_APPROVE_USERS=ou_owner1
 2. Bridge sends a permission card with Allow / Allow Session / Deny buttons
 3. User taps a button or replies 1/2/3
 4. AI continues execution → result streams back to Feishu card
-5. Timeout: 5 minutes → auto-deny
+5. Auto-deny on timeout (default 5 minutes, configurable via CTI_PERMISSION_TIMEOUT_SECS)
 ```
 
 ## Architecture

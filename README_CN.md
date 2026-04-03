@@ -21,11 +21,16 @@ Claude Code / Codex → 读写你的代码库
 - **飞书原生体验** — WebSocket 长连接、CardKit v1 流式卡片、交互按钮
 - **实时流式输出** — AI 响应以打字机效果流入飞书卡片
 - **思考过程展示** — extended thinking 实时显示，最终卡片中可折叠查看
-- **工具进度** — 运行中的工具显示耗时（`🔄 Bash (15s)`），每 5 秒自动刷新
-- **权限控制** — 工具调用需通过卡片按钮或快捷 `1/2/3` 回复审批
+- **工具进度** — 运行中的工具显示耗时（`🔄 Bash (15s)`），每秒自动刷新
+- **权限控制** — 工具调用需通过卡片按钮或快捷 `1/2/3` 回复审批，超时时间可配置
 - **配对审批** — 未知用户获得配对码，管理员通过交互卡片按钮审批
+- **引用回复** — 回复飞书消息时自动获取被引用内容（文本、图片、文件）作为上下文
+- **多模态输入** — 支持发送图片、文件（PDF、代码文件等）给 AI，最大 20MB
+- **多机器人协作** — 群聊中多个 AI 机器人可互相 @mention 对话，支持深度限制和冷却时间
+- **MCP 服务器 & Skills** — 自动加载 `~/.claude/settings.json` 中的 MCP 服务器和 `~/.claude/skills/` 中的技能
 - **斜杠命令** — `/ask`、`/run`、`/code` 转发给 AI；未知命令默认也转发
 - **双运行时** — Claude Code CLI 或 Codex SDK，通过配置切换
+- **第三方 API** — 支持通过 `ANTHROPIC_BASE_URL` 使用第三方 API 提供商
 - **会话持久化** — 对话在守护进程重启后保留，自动恢复会话
 
 ## 前置要求
@@ -61,6 +66,16 @@ CTI_DEFAULT_WORKDIR=/path/to/project
 CTI_FEISHU_APP_ID=cli_xxx
 CTI_FEISHU_APP_SECRET=xxx
 CTI_FEISHU_DOMAIN=feishu.cn
+
+# 可选：第三方 API 提供商
+# ANTHROPIC_API_KEY=your-key
+# ANTHROPIC_BASE_URL=https://your-provider.com/v1
+
+# 可选：自动审批所有工具权限（仅限受控环境）
+# CTI_AUTO_APPROVE=true
+
+# 可选：权限请求超时秒数（默认 300）
+# CTI_PERMISSION_TIMEOUT_SECS=300
 ```
 
 ### 3. 构建并启动
@@ -94,6 +109,23 @@ CTI_HOME=~/.claude-to-im bash scripts/daemon.sh start
 
 未识别的 `/命令` 默认转发给 AI（可通过 `CTI_FORWARD_UNKNOWN_COMMANDS=false` 关闭）。
 
+## 多机器人协作
+
+在群聊中启用多机器人协作后，多个 AI 机器人可以互相对话：
+
+1. AI 回复中包含 `@[机器人名]` 时，自动转换为飞书 @mention 并通过 HTTP relay 转发给对方
+2. 支持深度限制（`CTI_FEISHU_BOT_MAX_DEPTH`）防止无限对话循环
+3. 支持冷却时间（`CTI_FEISHU_BOT_COOLDOWN_MS`）控制响应频率
+
+配置：
+
+```env
+CTI_FEISHU_MULTI_BOT_ENABLED=true
+CTI_FEISHU_KNOWN_BOTS=BotA:ou_xxx,BotB:ou_yyy
+CTI_FEISHU_BOT_MAX_DEPTH=3          # 最大对话深度（默认 3）
+CTI_FEISHU_BOT_COOLDOWN_MS=5000     # 冷却时间毫秒（默认 5000）
+```
+
 ## 配对审批
 
 当 `CTI_FEISHU_PAIRING_ENABLED=true` 时，未知用户无法直接使用 AI：
@@ -119,7 +151,7 @@ CTI_FEISHU_PAIRING_AUTO_APPROVE_USERS=ou_owner1
 2. 桥接发送权限卡片，带 允许 / 允许本次会话 / 拒绝 按钮
 3. 用户点击按钮或回复 1/2/3
 4. AI 继续执行 → 结果流式回传到飞书卡片
-5. 超时：5 分钟 → 自动拒绝
+5. 超时自动拒绝（默认 5 分钟，可通过 CTI_PERMISSION_TIMEOUT_SECS 配置）
 ```
 
 ## 架构
