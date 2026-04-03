@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 
 import { CTI_HOME } from './config.js';
@@ -58,7 +59,7 @@ function writeFileData(data: PairingFileShape): void {
 function generateCode(): string {
   let out = '';
   for (let i = 0; i < 6; i += 1) {
-    out += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+    out += CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)];
   }
   return out;
 }

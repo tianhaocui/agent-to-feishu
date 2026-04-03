@@ -16,27 +16,33 @@ import type { PendingPermissions } from './permission-gateway.js';
 
 import { sseEvent } from './sse-utils.js';
 
-/** Load MCP server configs from ~/.claude/settings.json */
+/** Load MCP server configs from ~/.claude/settings.json (cached) */
+let _mcpCache: { value: Record<string, unknown> | undefined; ts: number } | null = null;
 function loadMcpServers(): Record<string, unknown> | undefined {
+  if (_mcpCache && Date.now() - _mcpCache.ts < 60_000) return _mcpCache.value;
   try {
     const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
     const data = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
     const servers = data.mcpServers;
     const disabled = new Set(data.disabledMcpServers || []);
-    if (!servers || typeof servers !== 'object') return undefined;
-    // Filter out disabled servers
+    if (!servers || typeof servers !== 'object') { _mcpCache = { value: undefined, ts: Date.now() }; return undefined; }
     const active: Record<string, unknown> = {};
     for (const [name, config] of Object.entries(servers)) {
       if (!disabled.has(name)) active[name] = config;
     }
-    return Object.keys(active).length > 0 ? active : undefined;
+    const result = Object.keys(active).length > 0 ? active : undefined;
+    _mcpCache = { value: result, ts: Date.now() };
+    return result;
   } catch {
+    _mcpCache = { value: undefined, ts: Date.now() };
     return undefined;
   }
 }
 
-/** Load skill names from ~/.claude/skills/ */
+/** Load skill names from ~/.claude/skills/ (cached) */
+let _skillsCache: { value: string[] | undefined; ts: number } | null = null;
 function loadSkillNames(): string[] | undefined {
+  if (_skillsCache && Date.now() - _skillsCache.ts < 60_000) return _skillsCache.value;
   try {
     const skillsDir = path.join(os.homedir(), '.claude', 'skills');
     const entries = fs.readdirSync(skillsDir);
@@ -46,8 +52,11 @@ function loadSkillNames(): string[] | undefined {
           && fs.existsSync(path.join(skillsDir, name, 'SKILL.md'));
       } catch { return false; }
     });
-    return names.length > 0 ? names : undefined;
+    const result = names.length > 0 ? names : undefined;
+    _skillsCache = { value: result, ts: Date.now() };
+    return result;
   } catch {
+    _skillsCache = { value: undefined, ts: Date.now() };
     return undefined;
   }
 }
@@ -139,7 +148,7 @@ export function buildSubprocessEnv(): Record<string, string> {
     // Pass everything except always-stripped vars
     for (const [k, v] of Object.entries(process.env)) {
       if (v === undefined) continue;
-      if (ENV_ALWAYS_STRIP.includes(k)) continue;
+      if (ENV_ALWAYS_STRIP.some(prefix => k.startsWith(prefix))) continue;
       out[k] = v;
     }
   } else {
@@ -544,6 +553,9 @@ export class SDKLLMProvider implements LLMProvider {
               mcpServers: loadMcpServers(),
               skills: loadSkillNames(),
               sandbox: { enabled: false },
+              systemPrompt: params.systemPrompt
+                ? { type: 'preset' as const, preset: 'claude_code' as const, append: params.systemPrompt }
+                : undefined,
               env: cleanEnv,
               stderr: (data: string) => {
                 stderrBuf += data;

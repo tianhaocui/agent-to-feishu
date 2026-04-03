@@ -342,8 +342,7 @@ export class JsonFileStore implements BridgeStore {
   updateSdkSessionId(sessionId: string, sdkSessionId: string): void {
     const s = this.sessions.get(sessionId);
     if (s) {
-      // Store sdkSessionId on the session object
-      (s as unknown as Record<string, unknown>)['sdk_session_id'] = sdkSessionId;
+      s.sdk_session_id = sdkSessionId;
       this.persistSessions();
     }
     // Also update any bindings that reference this session

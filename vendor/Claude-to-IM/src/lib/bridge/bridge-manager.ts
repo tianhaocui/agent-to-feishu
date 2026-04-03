@@ -730,16 +730,29 @@ async function processRegularMessage(
     // Use text or empty string for image-only messages (prompt is still required by streamClaude)
     let promptText = text || (hasAttachments ? '请分析这个文件的内容。' : '');
 
-    // Multi-bot context injection
-    const multiBotEnabled = store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
-    if (multiBotEnabled) {
-      if (msg.senderType === 'bot' && msg.senderName) {
+    // Chat environment context — injected as system prompt (not user message)
+    // to avoid being treated as prompt injection by the AI safety layer.
+    const senderLabel = msg.senderName || msg.address.displayName || '用户';
+    let chatContext: string;
+    if (msg.isGroup) {
+      const multiBotEnabled = store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
+      // Bot sender label stays in user message (it's message metadata)
+      if (multiBotEnabled && msg.senderType === 'bot' && msg.senderName) {
         promptText = `[来自机器人: ${msg.senderName}]\n${promptText}`;
       }
-      const peersRaw = store.getSetting('bridge_relay_peers') || '';
-      const peerNames = peersRaw.split(',').map(e => e.split(':')[0].trim()).filter(Boolean);
-      const peerList = peerNames.length > 0 ? `群里的其他机器人: ${peerNames.join(', ')}。` : '';
-      promptText = `[群聊环境] 这是飞书群聊。${peerList}要触发其他机器人请在回复中写 @[机器人名]（如 @[${peerNames[0] || '机器人名'}]），这会自动转为飞书@提及。\n\n${promptText}`;
+      chatContext = `[群聊环境] 这是飞书群聊。发送者: ${senderLabel}。`;
+      if (multiBotEnabled) {
+        const peerNames = msg.groupBotNames && msg.groupBotNames.length > 0
+          ? msg.groupBotNames
+          : getRelayPeerNames();
+        const peerList = peerNames.length > 0 ? `群里的其他机器人: ${peerNames.join(', ')}。` : '';
+        if (peerNames.length > 0) {
+          chatContext += peerList
+            + `重要：其他机器人不会自动看到你的回复。如果你需要某个机器人回应你，必须在回复中写 @[机器人名]（如 @[${peerNames[0]}]）来触发对方，否则对方不会收到你的消息。`;
+        }
+      }
+    } else {
+      chatContext = `[私聊环境] 这是与${senderLabel}的一对一私聊。`;
     }
 
     const result = await engine.processMessage(binding, promptText, async (perm) => {
@@ -805,7 +818,7 @@ async function processRegularMessage(
           message: 'Failed to forward question to IM',
         });
       }
-    });
+    }, chatContext);
 
     // Finalize streaming card if adapter supports it.
     // onStreamEnd awaits any in-flight card creation and returns true if a card
@@ -1204,7 +1217,14 @@ export function startRelayServer(): void {
     }
 
     let body = '';
-    for await (const chunk of req) body += chunk;
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > 65536) {
+        res.writeHead(413);
+        res.end('Payload too large');
+        return;
+      }
+    }
 
     try {
       const data = JSON.parse(body);
@@ -1227,6 +1247,7 @@ export function startRelayServer(): void {
             timestamp: Date.now(),
             senderType: senderType || 'bot',
             senderName: senderName || 'unknown-bot',
+            isGroup: true,
           };
           adapter.injectMessage(msg);
           injected = true;
@@ -1260,9 +1281,9 @@ export function stopRelayServer(): void {
   }
 }
 
-/** Check if a bot name is a known relay peer. */
-export function isRelayPeer(botName: string): boolean {
-  return relayPeers.has(botName.toLowerCase());
+/** Get all relay peer names (lowercase). */
+export function getRelayPeerNames(): string[] {
+  return Array.from(relayPeers.keys());
 }
 
 /**

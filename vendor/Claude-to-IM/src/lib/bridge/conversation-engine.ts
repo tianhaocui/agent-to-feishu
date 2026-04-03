@@ -76,6 +76,7 @@ export async function processMessage(
   onPartialText?: OnPartialText,
   onToolEvent?: OnToolEvent,
   onAskUserQuestion?: OnAskUserQuestion,
+  chatContext?: string,
 ): Promise<ConversationResult> {
   const { store, llm } = getBridgeContext();
   const sessionId = binding.codepilotSessionId;
@@ -177,7 +178,7 @@ export async function processMessage(
       sessionId,
       sdkSessionId: binding.sdkSessionId || undefined,
       model: effectiveModel,
-      systemPrompt: session?.system_prompt || undefined,
+      systemPrompt: [session?.system_prompt, chatContext].filter(Boolean).join('\n\n') || undefined,
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
       abortController,
       permissionMode,

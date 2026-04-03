@@ -60,6 +60,10 @@ export interface InboundMessage {
   senderName?: string;
   /** If true, message is stored as context only — no AI response triggered. */
   contextOnly?: boolean;
+  /** Whether the message originates from a group chat (vs private/p2p). */
+  isGroup?: boolean;
+  /** Names of other bots present in this group chat (populated by adapter). */
+  groupBotNames?: string[];
 }
 
 /** Outbound message to send to an IM channel */

@@ -21,8 +21,6 @@ export interface Config {
   // Multi-bot collaboration
   feishuMultiBotEnabled?: boolean;
   feishuKnownBots?: Array<{ name: string; openId: string }>;
-  feishuBotMaxDepth?: number;
-  feishuBotCooldownMs?: number;
   // Relay server for multi-bot communication
   relayPort?: number;
   relayPeers?: Array<{ name: string; host: string; port: number }>;
@@ -120,8 +118,6 @@ export function loadConfig(): Config {
     feishuPairingAdminChatId: env.get("CTI_FEISHU_PAIRING_ADMIN_CHAT_ID") || undefined,
     feishuMultiBotEnabled: env.get("CTI_FEISHU_MULTI_BOT_ENABLED") === "true",
     feishuKnownBots: parseKnownBots(env.get("CTI_FEISHU_KNOWN_BOTS")),
-    feishuBotMaxDepth: env.has("CTI_FEISHU_BOT_MAX_DEPTH") ? parseInt(env.get("CTI_FEISHU_BOT_MAX_DEPTH")!, 10) : undefined,
-    feishuBotCooldownMs: env.has("CTI_FEISHU_BOT_COOLDOWN_MS") ? parseInt(env.get("CTI_FEISHU_BOT_COOLDOWN_MS")!, 10) : undefined,
     relayPort: env.has("CTI_RELAY_PORT") ? parseInt(env.get("CTI_RELAY_PORT")!, 10) : undefined,
     relayPeers: parseRelayPeers(env.get("CTI_RELAY_PEERS")),
     forwardUnknownCommands: env.has("CTI_FORWARD_UNKNOWN_COMMANDS")
@@ -168,6 +164,25 @@ export function saveConfig(config: Config): void {
       "CTI_FEISHU_PAIRING_REQUIRE_DIRECT_MESSAGE",
       String(config.feishuPairingRequireDirectMessage)
     );
+  out += formatEnvLine("CTI_FEISHU_PAIRING_ADMIN_CHAT_ID", config.feishuPairingAdminChatId);
+  if (config.feishuMultiBotEnabled !== undefined)
+    out += formatEnvLine("CTI_FEISHU_MULTI_BOT_ENABLED", String(config.feishuMultiBotEnabled));
+  if (config.feishuKnownBots)
+    out += formatEnvLine(
+      "CTI_FEISHU_KNOWN_BOTS",
+      config.feishuKnownBots.map(b => `${b.name}:${b.openId}`).join(",")
+    );
+  if (config.relayPort !== undefined)
+    out += formatEnvLine("CTI_RELAY_PORT", String(config.relayPort));
+  if (config.relayPeers)
+    out += formatEnvLine(
+      "CTI_RELAY_PEERS",
+      config.relayPeers.map(p => `${p.name}:${p.host}:${p.port}`).join(",")
+    );
+  if (config.forwardUnknownCommands !== undefined)
+    out += formatEnvLine("CTI_FORWARD_UNKNOWN_COMMANDS", String(config.forwardUnknownCommands));
+  if (config.autoApprove !== undefined)
+    out += formatEnvLine("CTI_AUTO_APPROVE", String(config.autoApprove));
 
   fs.mkdirSync(CTI_HOME, { recursive: true });
   const tmpPath = CONFIG_PATH + ".tmp";
@@ -215,10 +230,6 @@ export function configToSettings(config: Config): Map<string, string> {
     m.set("bridge_feishu_multi_bot_enabled", "true");
   if (config.feishuKnownBots)
     m.set("bridge_feishu_known_bots", config.feishuKnownBots.map(b => `${b.name}:${b.openId}`).join(","));
-  if (config.feishuBotMaxDepth !== undefined)
-    m.set("bridge_feishu_bot_max_depth", String(config.feishuBotMaxDepth));
-  if (config.feishuBotCooldownMs !== undefined)
-    m.set("bridge_feishu_bot_cooldown_ms", String(config.feishuBotCooldownMs));
   if (config.relayPort !== undefined)
     m.set("bridge_relay_port", String(config.relayPort));
   if (config.relayPeers)
