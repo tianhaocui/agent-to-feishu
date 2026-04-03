@@ -161,6 +161,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private restClient: lark.Client | null = null;
   private seenMessageIds = new Map<string, boolean>();
   private botOpenId: string | null = null;
+  /** Bot's display name from /bot/v3/info/ API. */
+  public botName: string | null = null;
   /** All known bot IDs (open_id, user_id, union_id) for mention matching. */
   private botIds = new Set<string>();
   /** Track last incoming message ID per chat for typing indicator. */
@@ -171,6 +173,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private activeCards = new Map<string, StreamingCardState>();
   /** In-flight card creation promises per chatId — prevents duplicate creation. */
   private cardCreatePromises = new Map<string, Promise<boolean>>();
+  /** Known bots registry: name (lowercase) -> openId. */
+  private knownBots = new Map<string, string>();
+  /** Reverse lookup: openId -> name. */
+  private knownBotsByOpenId = new Map<string, string>();
+  /** Bot-to-bot conversation depth per chatId. */
+  private botConversationDepth = new Map<string, number>();
+  /** Last bot-triggered response time per chatId. */
+  private lastBotResponseTime = new Map<string, number>();
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -201,6 +211,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // Resolve bot identity for @mention detection
     await this.resolveBotIdentity(appId, appSecret, domain);
+
+    // Load known bots from config for multi-bot collaboration
+    this.loadKnownBots();
 
     this.running = true;
 
@@ -307,6 +320,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     } else {
       this.queue.push(msg);
     }
+  }
+
+  /** Inject a message into the adapter queue (used by relay server). */
+  public injectMessage(msg: InboundMessage): void {
+    this.enqueue(msg);
   }
 
   // ── Typing indicator (Openclaw-style reaction) ─────────────
@@ -568,7 +586,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
     try {
       const displayText = this.buildDisplayText(state);
       const resolvedText = optimizeMarkdownStyle(displayText);
-      console.log(`[feishu-adapter] Flush: phase=${state.phase}, len=${resolvedText.length}, reasoning=${state.isReasoningPhase}`);
 
       if (state.cardId) {
         // CardKit streaming — typewriter effect
@@ -641,7 +658,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
       if (!state.reasoningStartTime) state.reasoningStartTime = Date.now();
       state.isReasoningPhase = true;
       state.accumulatedReasoningText = split.reasoningText;
-      console.log(`[feishu-adapter] Reasoning update: ${split.reasoningText.length} chars`);
       void state.flush.throttledUpdate(
         state.cardId ? THROTTLE_CONSTANTS.CARDKIT_MS : THROTTLE_CONSTANTS.PATCH_MS,
       );
@@ -740,7 +756,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
         // Step 2: Build and apply final card
         const elapsedMs = Date.now() - state.startTime;
-        const displayText = responseText || state.completedText || state.accumulatedText || '';
+        const displayText = this.resolveOutboundMentions(
+          responseText || state.completedText || state.accumulatedText || '',
+          'card',
+        );
 
         const finalCardJson = buildFinalCardJson(displayText, state.toolCalls, {
           status,
@@ -812,7 +831,67 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
-    return this.finalizeCard(chatId, status, responseText);
+    this.lastBotResponseTime.set(chatId, Date.now());
+    const result = await this.finalizeCard(chatId, status, responseText);
+
+    // Multi-bot: relay mentions to peer bots via HTTP
+    // Match both @[BotName] and @BotName (for known bots)
+    const multiBotEnabled = getBridgeContext().store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
+    if (multiBotEnabled && status === 'completed' && responseText) {
+      const relayedBots = new Set<string>();
+
+      // Collect all mentioned bot names
+      // 1. @[BotName] format
+      const bracketPattern = /@\[([^\]]+)\]/g;
+      let match;
+      while ((match = bracketPattern.exec(responseText)) !== null) {
+        relayedBots.add(match[1]);
+      }
+      // 2. @BotName format — match against known bot names and relay peers
+      const { isRelayPeer } = await import('../bridge-manager.js');
+      const checkNames = new Set([...this.knownBots.keys()]);
+      // Add relay peer names from config (they may not be in knownBots yet)
+      const { store: ctxStore } = getBridgeContext();
+      const peersRaw = ctxStore.getSetting('bridge_relay_peers') || '';
+      for (const entry of peersRaw.split(',')) {
+        const parts = entry.split(':').map(s => s.trim());
+        if (parts.length >= 3) {
+          checkNames.add(parts.slice(0, parts.length - 2).join(':').toLowerCase());
+        }
+      }
+      for (const name of checkNames) {
+        if (relayedBots.has(name)) continue;
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const pattern = new RegExp(`@${escaped}(?![\\w])`, 'gi');
+        if (pattern.test(responseText)) {
+          relayedBots.add(name);
+        }
+      }
+
+      const myName = this.knownBotsByOpenId.get(this.botOpenId || '') || 'unknown';
+
+      for (const botName of relayedBots) {
+        // Extract context: find the mention and take text after it
+        const idx = responseText.toLowerCase().indexOf(`@${botName.toLowerCase()}`);
+        const afterIdx = idx >= 0 ? responseText.indexOf(' ', idx + botName.length + 1) : -1;
+        const context = afterIdx >= 0 ? responseText.slice(afterIdx).trim().slice(0, 500) : '';
+        const relayText = context || responseText.slice(0, 500);
+
+        try {
+          const { relayToBot } = await import('../bridge-manager.js');
+          const sent = await relayToBot(botName, chatId, relayText, myName);
+          if (sent) {
+            console.log(`[feishu-adapter] Relayed to ${botName} via HTTP`);
+          } else {
+            console.warn(`[feishu-adapter] HTTP relay failed for ${botName}`);
+          }
+        } catch (err) {
+          console.warn(`[feishu-adapter] Relay error for ${botName}:`, err);
+        }
+      }
+    }
+
+    return result;
   }
 
   // ── Send ────────────────────────────────────────────────────
@@ -853,7 +932,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Used for code blocks and tables — card renders them properly.
    */
   private async sendAsCard(chatId: string, text: string): Promise<SendResult> {
-    const cardContent = buildCardContent(text);
+    const cardContent = buildCardContent(this.resolveOutboundMentions(text, 'card'));
 
     try {
       const res = await this.restClient!.im.message.create({
@@ -882,7 +961,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Used for simple text — renders bold, italic, inline code, links.
    */
   private async sendAsPost(chatId: string, text: string): Promise<SendResult> {
-    const postContent = buildPostContent(text);
+    const postContent = buildPostContent(this.resolveOutboundMentions(text, 'post'));
 
     try {
       const res = await this.restClient!.im.message.create({
@@ -1138,9 +1217,33 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private async processIncomingEvent(data: FeishuMessageEventData): Promise<void> {
     const msg = data.message;
     const sender = data.sender;
+    const isBotSender = sender.sender_type === 'bot';
+    let contextOnly = false;
 
-    // [P1] Filter out bot messages to prevent self-triggering loops
-    if (sender.sender_type === 'bot') return;
+    // [P1] Filter bot messages
+    if (isBotSender) {
+      const multiBotEnabled = getBridgeContext().store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
+      if (!multiBotEnabled) return; // Legacy: drop all bot messages
+
+      const senderOpenId = sender.sender_id?.open_id || '';
+      if (!senderOpenId || this.botIds.has(senderOpenId)) return; // Self or unidentifiable
+
+      // Auto-discover bot from sender
+      this.registerBotFromMentions(msg.mentions);
+
+      // For bot messages: accept if this bot is @mentioned OR if the message content contains this bot's name
+      const mentioned = this.isBotMentioned(msg.mentions);
+      const botName = this.knownBotsByOpenId.get(this.botOpenId || '') || '';
+      const textContent = msg.content || '';
+      const mentionedInText = botName && textContent.includes(botName);
+      if (!mentioned && !mentionedInText) {
+        // Not directed at us — store as context only
+        contextOnly = true;
+        console.log('[feishu-adapter] Bot message stored as context (this bot not mentioned), chatId:', msg.chat_id);
+      } else {
+        console.log(`[feishu-adapter] Accepting bot message from ${senderOpenId}, mentioned=${mentioned}, mentionedInText=${mentionedInText}`);
+      }
+    }
 
     // Dedup by message_id
     if (this.seenMessageIds.has(msg.message_id)) return;
@@ -1182,18 +1285,26 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
       // Require @mention check
       const requireMention = getBridgeContext().store.getSetting('bridge_feishu_require_mention') !== 'false';
-      if (requireMention && !this.isBotMentioned(msg.mentions)) {
-        console.log('[feishu-adapter] Group message ignored (bot not @mentioned), chatId:', chatId, 'msgId:', msg.message_id);
-        try {
-          getBridgeContext().store.insertAuditLog({
-            channelType: 'feishu',
-            chatId,
-            direction: 'inbound',
-            messageId: msg.message_id,
-            summary: '[FILTERED] Group message dropped: bot not @mentioned (require_mention=true)',
-          });
-        } catch { /* best effort */ }
-        return;
+      const botMentioned = this.isBotMentioned(msg.mentions);
+      const isContextOnlyMsg = requireMention && !botMentioned;
+      if (isContextOnlyMsg) {
+        // Multi-bot: store as context instead of dropping
+        const multiBotEnabled = getBridgeContext().store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
+        if (!multiBotEnabled) {
+          console.log('[feishu-adapter] Group message ignored (bot not @mentioned), chatId:', chatId, 'msgId:', msg.message_id);
+          try {
+            getBridgeContext().store.insertAuditLog({
+              channelType: 'feishu',
+              chatId,
+              direction: 'inbound',
+              messageId: msg.message_id,
+              summary: '[FILTERED] Group message dropped: bot not @mentioned (require_mention=true)',
+            });
+          } catch { /* best effort */ }
+          return;
+        }
+        // Multi-bot enabled: fall through with contextOnly flag
+        contextOnly = true;
       }
     }
 
@@ -1302,7 +1413,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     // Strip @mention markers from text
-    text = this.stripMentionMarkers(text);
+    text = this.resolveMentionMarkers(text, msg.mentions);
 
     // Fetch quoted message content if this is a reply
     if (msg.parent_id) {
@@ -1354,6 +1465,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
       text: text.trim(),
       timestamp,
       attachments: attachments.length > 0 ? attachments : undefined,
+      senderType: isBotSender ? 'bot' : 'user',
+      senderName: isBotSender ? (this.knownBotsByOpenId.get(userId) || userId) : undefined,
+      contextOnly: contextOnly || undefined,
     };
 
     // Audit log
@@ -1545,6 +1659,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
       if (botData?.bot?.open_id) {
         this.botOpenId = botData.bot.open_id;
         this.botIds.add(botData.bot.open_id);
+        // Register own name for relay senderName
+        if (botData.bot.app_name) {
+          this.knownBotsByOpenId.set(botData.bot.open_id, botData.bot.app_name);
+          this.botName = botData.bot.app_name;
+          console.log(`[feishu-adapter] Bot identity: ${botData.bot.app_name} (${botData.bot.open_id})`);
+        }
       }
       // Also record app_id-based IDs if available
       if (botData?.bot?.bot_id) {
@@ -1558,6 +1678,35 @@ export class FeishuAdapter extends BaseChannelAdapter {
         '[feishu-adapter] Failed to resolve bot identity:',
         err instanceof Error ? err.message : err,
       );
+    }
+  }
+
+  /** Load known bots from config settings. */
+  private loadKnownBots(): void {
+    const raw = getBridgeContext().store.getSetting('bridge_feishu_known_bots') || '';
+    if (!raw) return;
+    for (const pair of raw.split(',')) {
+      const [name, openId] = pair.split(':').map(s => s.trim());
+      if (name && openId) {
+        this.knownBots.set(name.toLowerCase(), openId);
+        this.knownBotsByOpenId.set(openId, name);
+        console.log(`[feishu-adapter] Loaded known bot: ${name} -> ${openId}`);
+      }
+    }
+  }
+
+  /** Auto-discover bots from message mentions. */
+  private registerBotFromMentions(
+    mentions?: FeishuMessageEventData['message']['mentions'],
+  ): void {
+    if (!mentions) return;
+    for (const m of mentions) {
+      const openId = m.id.open_id;
+      if (openId && !this.botIds.has(openId) && !this.knownBotsByOpenId.has(openId)) {
+        this.knownBots.set(m.name.toLowerCase(), openId);
+        this.knownBotsByOpenId.set(openId, m.name);
+        console.log(`[feishu-adapter] Auto-discovered bot: ${m.name} -> ${openId}`);
+      }
     }
   }
 
@@ -1576,9 +1725,59 @@ export class FeishuAdapter extends BaseChannelAdapter {
     });
   }
 
-  private stripMentionMarkers(text: string): string {
-    // Feishu uses @_user_N placeholders for mentions
-    return text.replace(/@_user_\d+/g, '').trim();
+  /**
+   * Resolve mention placeholders: strip self-mentions, replace others with @Name.
+   */
+  private resolveMentionMarkers(
+    text: string,
+    mentions?: FeishuMessageEventData['message']['mentions'],
+  ): string {
+    if (!mentions || mentions.length === 0) {
+      return text.replace(/@_user_\d+/g, '').trim();
+    }
+    // Build a map of placeholder -> display text
+    for (const m of mentions) {
+      const ids = [m.id.open_id, m.id.user_id, m.id.union_id].filter(Boolean) as string[];
+      const isSelf = ids.some(id => this.botIds.has(id));
+      if (isSelf) {
+        // Strip self-mention
+        text = text.replace(new RegExp(m.key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '');
+      } else {
+        // Replace with @Name for context
+        text = text.replace(new RegExp(m.key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), `@${m.name}`);
+        // Auto-discover other bots from mentions
+        const openId = m.id.open_id;
+        if (openId && !this.knownBots.has(m.name.toLowerCase())) {
+          this.knownBots.set(m.name.toLowerCase(), openId);
+          this.knownBotsByOpenId.set(openId, m.name);
+          console.log(`[feishu-adapter] Auto-discovered bot from mention: ${m.name} -> ${openId}`);
+        }
+      }
+    }
+    return text.trim();
+  }
+
+  /**
+   * Resolve outbound @[BotName] mentions to Feishu mention markup.
+   */
+  private resolveOutboundMentions(text: string, format: 'post' | 'card' = 'post'): string {
+    // First: @[BotName] format
+    text = text.replace(/@\[([^\]]+)\]/g, (match, name: string) => {
+      const openId = this.knownBots.get(name.toLowerCase());
+      if (!openId) return match;
+      return format === 'card'
+        ? `<at id=${openId}></at>`
+        : `<at user_id="${openId}">${name}</at>`;
+    });
+    // Second: @BotName format (known bots only, avoid false positives)
+    for (const [name, openId] of this.knownBots) {
+      const pattern = new RegExp(`@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w\\[])`, 'gi');
+      const replacement = format === 'card'
+        ? `<at id=${openId}></at>`
+        : `<at user_id="${openId}">${name}</at>`;
+      text = text.replace(pattern, replacement);
+    }
+    return text;
   }
 
   // ── Resource download ───────────────────────────────────────

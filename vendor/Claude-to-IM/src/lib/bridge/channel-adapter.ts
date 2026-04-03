@@ -119,6 +119,12 @@ export abstract class BaseChannelAdapter {
    * Returns true if a card was finalized (caller should skip normal delivery).
    */
   onStreamEnd?(_chatId: string, _status: 'completed' | 'interrupted' | 'error', _responseText: string): Promise<boolean>;
+
+  /** Inject a message into the adapter queue (used by relay server). */
+  injectMessage?(_msg: import('./types.js').InboundMessage): void;
+
+  /** Bot's display name (resolved at startup). */
+  botName?: string | null;
 }
 
 // ── Adapter Registry ────────────────────────────────────────────
