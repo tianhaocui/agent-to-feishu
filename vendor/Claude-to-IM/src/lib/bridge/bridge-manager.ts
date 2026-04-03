@@ -254,6 +254,9 @@ export async function start(): Promise<void> {
   }
 
   console.log(`[bridge-manager] Bridge started with ${startedCount} adapter(s)`);
+
+  // Start relay server for multi-bot communication
+  startRelayServer();
 }
 
 /**
@@ -289,6 +292,9 @@ export async function stop(): Promise<void> {
 
   // Notify host that bridge stopped
   lifecycle.onBridgeStop?.();
+
+  // Stop relay server
+  stopRelayServer();
 
   console.log('[bridge-manager] Bridge stopped');
 }
@@ -588,6 +594,12 @@ async function handleMessage(
 
   if (!text && !hasAttachments) { ack(); return; }
 
+  // Context-only messages: skip processing entirely
+  if (msg.contextOnly) {
+    ack();
+    return;
+  }
+
   await processRegularMessage(adapter, msg, text, hasAttachments);
 }
 
@@ -716,7 +728,19 @@ async function processRegularMessage(
     // Pass permission callback so requests are forwarded to IM immediately
     // during streaming (the stream blocks until permission is resolved).
     // Use text or empty string for image-only messages (prompt is still required by streamClaude)
-    const promptText = text || (hasAttachments ? '请分析这个文件的内容。' : '');
+    let promptText = text || (hasAttachments ? '请分析这个文件的内容。' : '');
+
+    // Multi-bot context injection
+    const multiBotEnabled = store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
+    if (multiBotEnabled) {
+      if (msg.senderType === 'bot' && msg.senderName) {
+        promptText = `[来自机器人: ${msg.senderName}]\n${promptText}`;
+      }
+      const peersRaw = store.getSetting('bridge_relay_peers') || '';
+      const peerNames = peersRaw.split(',').map(e => e.split(':')[0].trim()).filter(Boolean);
+      const peerList = peerNames.length > 0 ? `群里的其他机器人: ${peerNames.join(', ')}。` : '';
+      promptText = `[群聊环境] 这是飞书群聊。${peerList}要触发其他机器人请在回复中写 @[机器人名]（如 @[${peerNames[0] || '机器人名'}]），这会自动转为飞书@提及。\n\n${promptText}`;
+    }
 
     const result = await engine.processMessage(binding, promptText, async (perm) => {
       await broker.forwardPermissionRequest(
@@ -1136,6 +1160,143 @@ export function computeSdkSessionUpdate(
     return '';
   }
   return null;
+}
+
+// ── Relay Server for Multi-Bot Communication ────────────────
+
+import http from 'node:http';
+
+let relayServer: http.Server | null = null;
+
+/** Parsed relay peers: name (lowercase) -> { host, port } */
+const relayPeers = new Map<string, { host: string; port: number }>();
+
+function parseRelayPeersFromSetting(): void {
+  const { store } = getBridgeContext();
+  const raw = store.getSetting('bridge_relay_peers') || '';
+  relayPeers.clear();
+  if (!raw) return;
+  for (const entry of raw.split(',')) {
+    const parts = entry.split(':').map(s => s.trim());
+    if (parts.length >= 3) {
+      const port = parseInt(parts[parts.length - 1], 10);
+      const host = parts[parts.length - 2];
+      const name = parts.slice(0, parts.length - 2).join(':');
+      if (name && host && !isNaN(port)) {
+        relayPeers.set(name.toLowerCase(), { host, port });
+      }
+    }
+  }
+}
+
+export function startRelayServer(): void {
+  const { store } = getBridgeContext();
+  const port = parseInt(store.getSetting('bridge_relay_port') || '', 10);
+  if (!port) return;
+
+  parseRelayPeersFromSetting();
+
+  relayServer = http.createServer(async (req, res) => {
+    if (req.method !== 'POST' || req.url !== '/relay') {
+      res.writeHead(404);
+      res.end('Not found');
+      return;
+    }
+
+    let body = '';
+    for await (const chunk of req) body += chunk;
+
+    try {
+      const data = JSON.parse(body);
+      const { chatId, text, senderName, senderType } = data;
+      if (!chatId || !text) {
+        res.writeHead(400);
+        res.end('Missing chatId or text');
+        return;
+      }
+
+      // Find the first available adapter and inject the message
+      const state = getState();
+      let injected = false;
+      for (const [, adapter] of state.adapters) {
+        if (adapter.injectMessage) {
+          const msg: InboundMessage = {
+            messageId: `relay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            address: { channelType: adapter.channelType, chatId },
+            text,
+            timestamp: Date.now(),
+            senderType: senderType || 'bot',
+            senderName: senderName || 'unknown-bot',
+          };
+          adapter.injectMessage(msg);
+          injected = true;
+          console.log(`[relay-server] Injected message from ${senderName} to chat ${chatId}`);
+          break;
+        }
+      }
+
+      res.writeHead(injected ? 200 : 503);
+      res.end(injected ? 'OK' : 'No adapter available');
+    } catch (err) {
+      console.error('[relay-server] Error processing relay:', err);
+      res.writeHead(500);
+      res.end('Internal error');
+    }
+  });
+
+  relayServer.listen(port, () => {
+    console.log(`[relay-server] Listening on port ${port}`);
+    if (relayPeers.size > 0) {
+      console.log(`[relay-server] Known peers: ${Array.from(relayPeers.entries()).map(([n, p]) => `${n}@${p.host}:${p.port}`).join(', ')}`);
+    }
+  });
+}
+
+export function stopRelayServer(): void {
+  if (relayServer) {
+    relayServer.close();
+    relayServer = null;
+    console.log('[relay-server] Stopped');
+  }
+}
+
+/** Check if a bot name is a known relay peer. */
+export function isRelayPeer(botName: string): boolean {
+  return relayPeers.has(botName.toLowerCase());
+}
+
+/**
+ * Send a relay message to a peer bot by name.
+ * Returns true if the message was sent successfully.
+ */
+export async function relayToBot(botName: string, chatId: string, text: string, senderName: string): Promise<boolean> {
+  const peer = relayPeers.get(botName.toLowerCase());
+  if (!peer) {
+    console.warn(`[relay-server] Unknown peer bot: ${botName}`);
+    return false;
+  }
+
+  const payload = JSON.stringify({ chatId, text, senderName, senderType: 'bot' });
+
+  return new Promise<boolean>((resolve) => {
+    const req = http.request({
+      hostname: peer.host,
+      port: peer.port,
+      path: '/relay',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      timeout: 5000,
+    }, (res) => {
+      res.resume();
+      resolve(res.statusCode === 200);
+    });
+    req.on('error', (err) => {
+      console.warn(`[relay-server] Failed to relay to ${botName}:`, err.message);
+      resolve(false);
+    });
+    req.write(payload);
+    req.end();
+  });
 }
 
 // ── Test-only export ─────────────────────────────────────────

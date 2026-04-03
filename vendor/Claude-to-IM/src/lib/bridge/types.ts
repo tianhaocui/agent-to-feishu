@@ -54,6 +54,12 @@ export interface InboundMessage {
   updateId?: number;
   /** File attachments (images, documents) from the IM channel */
   attachments?: import('./host.js').FileAttachment[];
+  /** Sender type: 'user' or 'bot'. Used for multi-bot collaboration. */
+  senderType?: 'user' | 'bot';
+  /** Display name of the sender (bot name or user name). */
+  senderName?: string;
+  /** If true, message is stored as context only — no AI response triggered. */
+  contextOnly?: boolean;
 }
 
 /** Outbound message to send to an IM channel */

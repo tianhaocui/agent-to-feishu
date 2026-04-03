@@ -18,6 +18,14 @@ export interface Config {
   feishuPairingAutoApproveUsers?: string[];
   feishuPairingRequireDirectMessage?: boolean;
   feishuPairingAdminChatId?: string;
+  // Multi-bot collaboration
+  feishuMultiBotEnabled?: boolean;
+  feishuKnownBots?: Array<{ name: string; openId: string }>;
+  feishuBotMaxDepth?: number;
+  feishuBotCooldownMs?: number;
+  // Relay server for multi-bot communication
+  relayPort?: number;
+  relayPeers?: Array<{ name: string; host: string; port: number }>;
   // Forward unrecognized slash commands to AI CLI as prompts
   forwardUnknownCommands?: boolean;
   // Auto-approve all tool permission requests without user confirmation
@@ -56,6 +64,31 @@ function splitCsv(value: string | undefined): string[] | undefined {
     .filter(Boolean);
 }
 
+function parseKnownBots(value: string | undefined): Array<{ name: string; openId: string }> | undefined {
+  if (!value) return undefined;
+  const bots: Array<{ name: string; openId: string }> = [];
+  for (const pair of value.split(",")) {
+    const [name, openId] = pair.split(":").map(s => s.trim());
+    if (name && openId) bots.push({ name, openId });
+  }
+  return bots.length > 0 ? bots : undefined;
+}
+
+function parseRelayPeers(value: string | undefined): Array<{ name: string; host: string; port: number }> | undefined {
+  if (!value) return undefined;
+  const peers: Array<{ name: string; host: string; port: number }> = [];
+  for (const entry of value.split(",")) {
+    const parts = entry.split(":").map(s => s.trim());
+    if (parts.length >= 3) {
+      const port = parseInt(parts[parts.length - 1], 10);
+      const host = parts[parts.length - 2];
+      const name = parts.slice(0, parts.length - 2).join(":");
+      if (name && host && !isNaN(port)) peers.push({ name, host, port });
+    }
+  }
+  return peers.length > 0 ? peers : undefined;
+}
+
 export function loadConfig(): Config {
   let env = new Map<string, string>();
   try {
@@ -85,6 +118,12 @@ export function loadConfig(): Config {
       ? env.get("CTI_FEISHU_PAIRING_REQUIRE_DIRECT_MESSAGE") === "true"
       : undefined,
     feishuPairingAdminChatId: env.get("CTI_FEISHU_PAIRING_ADMIN_CHAT_ID") || undefined,
+    feishuMultiBotEnabled: env.get("CTI_FEISHU_MULTI_BOT_ENABLED") === "true",
+    feishuKnownBots: parseKnownBots(env.get("CTI_FEISHU_KNOWN_BOTS")),
+    feishuBotMaxDepth: env.has("CTI_FEISHU_BOT_MAX_DEPTH") ? parseInt(env.get("CTI_FEISHU_BOT_MAX_DEPTH")!, 10) : undefined,
+    feishuBotCooldownMs: env.has("CTI_FEISHU_BOT_COOLDOWN_MS") ? parseInt(env.get("CTI_FEISHU_BOT_COOLDOWN_MS")!, 10) : undefined,
+    relayPort: env.has("CTI_RELAY_PORT") ? parseInt(env.get("CTI_RELAY_PORT")!, 10) : undefined,
+    relayPeers: parseRelayPeers(env.get("CTI_RELAY_PEERS")),
     forwardUnknownCommands: env.has("CTI_FORWARD_UNKNOWN_COMMANDS")
       ? env.get("CTI_FORWARD_UNKNOWN_COMMANDS") !== "false"
       : true,
@@ -172,6 +211,18 @@ export function configToSettings(config: Config): Map<string, string> {
     );
   if (config.feishuPairingAdminChatId)
     m.set("bridge_feishu_pairing_admin_chat_id", config.feishuPairingAdminChatId);
+  if (config.feishuMultiBotEnabled)
+    m.set("bridge_feishu_multi_bot_enabled", "true");
+  if (config.feishuKnownBots)
+    m.set("bridge_feishu_known_bots", config.feishuKnownBots.map(b => `${b.name}:${b.openId}`).join(","));
+  if (config.feishuBotMaxDepth !== undefined)
+    m.set("bridge_feishu_bot_max_depth", String(config.feishuBotMaxDepth));
+  if (config.feishuBotCooldownMs !== undefined)
+    m.set("bridge_feishu_bot_cooldown_ms", String(config.feishuBotCooldownMs));
+  if (config.relayPort !== undefined)
+    m.set("bridge_relay_port", String(config.relayPort));
+  if (config.relayPeers)
+    m.set("bridge_relay_peers", config.relayPeers.map(p => `${p.name}:${p.host}:${p.port}`).join(","));
   if (config.forwardUnknownCommands !== undefined)
     m.set("bridge_forward_unknown_commands", String(config.forwardUnknownCommands));
 

@@ -6,6 +6,8 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { SDKMessage, PermissionResult } from '@anthropic-ai/claude-agent-sdk';
@@ -13,6 +15,42 @@ import type { LLMProvider, StreamChatParams, FileAttachment } from 'claude-to-im
 import type { PendingPermissions } from './permission-gateway.js';
 
 import { sseEvent } from './sse-utils.js';
+
+/** Load MCP server configs from ~/.claude/settings.json */
+function loadMcpServers(): Record<string, unknown> | undefined {
+  try {
+    const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+    const data = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+    const servers = data.mcpServers;
+    const disabled = new Set(data.disabledMcpServers || []);
+    if (!servers || typeof servers !== 'object') return undefined;
+    // Filter out disabled servers
+    const active: Record<string, unknown> = {};
+    for (const [name, config] of Object.entries(servers)) {
+      if (!disabled.has(name)) active[name] = config;
+    }
+    return Object.keys(active).length > 0 ? active : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Load skill names from ~/.claude/skills/ */
+function loadSkillNames(): string[] | undefined {
+  try {
+    const skillsDir = path.join(os.homedir(), '.claude', 'skills');
+    const entries = fs.readdirSync(skillsDir);
+    const names = entries.filter(name => {
+      try {
+        return fs.statSync(path.join(skillsDir, name)).isDirectory()
+          && fs.existsSync(path.join(skillsDir, name, 'SKILL.md'));
+      } catch { return false; }
+    });
+    return names.length > 0 ? names : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 // ── Environment isolation ──
 
@@ -501,7 +539,11 @@ export class SDKLLMProvider implements LLMProvider {
               resume: params.sdkSessionId || undefined,
               abortController: params.abortController,
               permissionMode: (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
+              thinking: { type: 'adaptive' },
               includePartialMessages: true,
+              mcpServers: loadMcpServers(),
+              skills: loadSkillNames(),
+              sandbox: { enabled: false },
               env: cleanEnv,
               stderr: (data: string) => {
                 stderrBuf += data;
@@ -636,18 +678,15 @@ export function handleMessage(
   controller: ReadableStreamDefaultController<string>,
   state: StreamState,
 ): void {
-  // Log all SDK message types for debugging thinking events
-  if (msg.type !== 'stream_event') {
-    console.log(`[llm-provider] msg.type: ${msg.type}`);
-  }
   switch (msg.type) {
     case 'stream_event': {
       const event = msg.event;
-      // Log all stream event types for debugging
-      if (event.type === 'content_block_delta') {
-        console.log(`[llm-provider] stream_event delta type: ${event.delta.type}`);
-      } else if (event.type === 'content_block_start') {
-        console.log(`[llm-provider] stream_event block_start type: ${event.content_block?.type}`);
+      // Log content block starts to verify thinking support
+      if (event.type === 'content_block_start') {
+        console.log(`[llm-provider] block_start: ${event.content_block?.type}`);
+      }
+      if (event.type === 'content_block_delta' && event.delta.type === 'thinking_delta') {
+        console.log(`[llm-provider] thinking_delta received, len=${(event.delta as any).thinking?.length}`);
       }
       if (
         event.type === 'content_block_delta' &&
@@ -689,7 +728,9 @@ export function handleMessage(
       // CLI returned as assistant text without prior streaming deltas.
       if (msg.message?.content) {
         for (const block of msg.message.content) {
-          if (block.type === 'text' && block.text) {
+          if (block.type === 'thinking' && (block as any).thinking) {
+            // Skip — thinking content already emitted via thinking_delta events
+          } else if (block.type === 'text' && block.text) {
             state.lastAssistantText += (state.lastAssistantText ? '\n' : '') + block.text;
           } else if (block.type === 'tool_use') {
             controller.enqueue(

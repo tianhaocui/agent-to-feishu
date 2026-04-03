@@ -22,6 +22,10 @@ function buildTextMessage(address: InboundMessage['address'], text: string): Out
 
 export class FeishuPairingAdapter extends BaseChannelAdapter {
   readonly channelType = 'feishu' as const;
+
+  get botName(): string | null | undefined {
+    return (this.inner as any).botName;
+  }
   private readonly inner = new UpstreamFeishuAdapter();
   private readonly pairingStore = getFeishuPairingStore();
 
@@ -131,6 +135,10 @@ export class FeishuPairingAdapter extends BaseChannelAdapter {
 
   onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
     return this.inner.onStreamEnd ? this.inner.onStreamEnd(chatId, status, responseText) : Promise.resolve(false);
+  }
+
+  injectMessage(msg: InboundMessage): void {
+    (this.inner as any).injectMessage(msg);
   }
 
   async sendRawCard(chatId: string, cardJson: string): Promise<SendResult> {
