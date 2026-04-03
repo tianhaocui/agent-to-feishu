@@ -750,6 +750,10 @@ async function processRegularMessage(
           chatContext += peerList
             + `重要：其他机器人不会自动看到你的回复。如果你需要某个机器人回应你，必须在回复中写 @[机器人名]（如 @[${peerNames[0]}]）来触发对方，否则对方不会收到你的消息。`;
         }
+        // When replying to a bot message, remind to @ the sender specifically
+        if (msg.senderType === 'bot' && msg.senderName) {
+          chatContext += `\n\n当前消息来自机器人「${msg.senderName}」。你的回复必须包含 @[${msg.senderName}] 否则对方收不到。`;
+        }
       }
     } else {
       chatContext = `[私聊环境] 这是与${senderLabel}的一对一私聊。`;
