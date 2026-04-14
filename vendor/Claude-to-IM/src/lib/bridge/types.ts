@@ -48,6 +48,8 @@ export interface InboundMessage {
   callbackData?: string;
   /** For callback queries: the message ID of the original message that triggered the callback */
   callbackMessageId?: string;
+  /** For form submissions: the form field values */
+  formValue?: Record<string, unknown>;
   /** Platform-specific raw update object (for adapter-specific handling) */
   raw?: unknown;
   /** Adapter-specific update ID for deferred offset acknowledgement */
@@ -64,6 +66,14 @@ export interface InboundMessage {
   isGroup?: boolean;
   /** Names of other bots present in this group chat (populated by adapter). */
   groupBotNames?: string[];
+  /** Thread root message ID — for topic-group session isolation. */
+  threadId?: string;
+  /** Whether @all / @所有人 was mentioned. */
+  mentionAll?: boolean;
+  /** Resolved group chat name (from Feishu API). */
+  groupName?: string;
+  /** Group chat mode: 'group' | 'topic' | 'p2p'. */
+  groupChatMode?: string;
 }
 
 /** Outbound message to send to an IM channel */
@@ -76,6 +86,8 @@ export interface OutboundMessage {
   parseMode?: 'HTML' | 'Markdown' | 'plain';
   /** Inline keyboard buttons */
   inlineButtons?: InlineButton[][];
+  /** Raw CardKit v2 JSON string — sent as interactive card instead of text */
+  cardJson?: string;
   /** If replying to a specific message */
   replyToMessageId?: string;
 }

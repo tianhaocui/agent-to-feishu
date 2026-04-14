@@ -71,6 +71,9 @@ export abstract class BaseChannelAdapter {
   /** Edit an existing message's content. Optional — not all platforms support this. */
   editMessage?(_messageId: string, _text: string): Promise<boolean>;
 
+  /** Update an existing card message in-place. Optional — Feishu only. */
+  patchCardMessage?(_messageId: string, _cardJson: string): Promise<boolean>;
+
   /** Called when message processing ends. */
   onMessageEnd?(_chatId: string): void;
 
@@ -118,13 +121,19 @@ export abstract class BaseChannelAdapter {
    * (close streaming mode, add footer, etc.).
    * Returns true if a card was finalized (caller should skip normal delivery).
    */
-  onStreamEnd?(_chatId: string, _status: 'completed' | 'interrupted' | 'error', _responseText: string): Promise<boolean>;
+  onStreamEnd?(_chatId: string, _status: 'completed' | 'interrupted' | 'error', _responseText: string, _meta?: StreamEndMeta): Promise<boolean>;
 
   /** Inject a message into the adapter queue (used by relay server). */
   injectMessage?(_msg: import('./types.js').InboundMessage): void;
 
   /** Bot's display name (resolved at startup). */
   botName?: string | null;
+}
+
+/** Metadata passed to onStreamEnd for card footer rendering. */
+export interface StreamEndMeta {
+  tokenUsage?: { input: number; output: number; cacheRead?: number; cacheCreation?: number };
+  model?: string;
 }
 
 // ── Adapter Registry ────────────────────────────────────────────

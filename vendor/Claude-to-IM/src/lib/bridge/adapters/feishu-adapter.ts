@@ -54,9 +54,7 @@ import {
   isMessageUnavailableError,
   extractLarkApiCode,
 } from './feishu-card-error.js';
-
-/** Max number of message_ids to keep for dedup. */
-const DEDUP_MAX = 1000;
+import { LruCache } from '../lru-cache.js';
 
 /** Max file download size (20 MB). */
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
@@ -110,6 +108,10 @@ interface StreamingCardState {
   toolHeartbeat: ReturnType<typeof setInterval> | null;
   /** Whether the message was detected as unavailable (recalled/deleted). */
   terminated: boolean;
+  /** Image resolver for converting markdown image URLs to Feishu image keys. */
+  imageResolver: import('../card-image-resolver.js').ImageResolver | null;
+  /** Centralized guard for recalled/deleted message detection. */
+  guard: import('../unavailable-guard.js').UnavailableGuard | null;
 }
 
 /** Escape a string for use in a RegExp. */
@@ -139,6 +141,8 @@ type FeishuMessageEventData = {
     message_type: string;
     content: string;
     create_time: string;
+    root_id?: string;
+    thread_id?: string;
     mentions?: Array<{
       key: string;
       id: { open_id?: string; union_id?: string; user_id?: string };
@@ -164,7 +168,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private waiters: Array<(msg: InboundMessage | null) => void> = [];
   private wsClient: lark.WSClient | null = null;
   private restClient: lark.Client | null = null;
-  private seenMessageIds = new Map<string, boolean>();
+  private seenMessageIds = new LruCache<true>(5000, 12 * 60 * 60 * 1000);
   private botOpenId: string | null = null;
   /** Bot's display name from /bot/v3/info/ API. */
   public botName: string | null = null;
@@ -184,6 +188,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private knownBotsByOpenId = new Map<string, string>();
   /** Observed bots per group chat: chatId -> Set<botName>. */
   private groupObservedBots = new Map<string, Set<string>>();
+  /** Track which chatIds are group chats (for relay filtering). */
+  private groupChatIds = new Set<string>();
+  /** LRU cache: openId -> display name (TTL 30min, max 500). */
+  private userNameCache = new LruCache<string>(500, 30 * 60 * 1000);
+  /** LRU cache: chatId -> chat info (TTL 1hr, max 500). */
+  private chatInfoCache = new LruCache<{ name: string; chatMode?: string; groupMessageType?: string }>(500, 60 * 60 * 1000);
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -228,6 +238,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
       'card.action.trigger': (async (data: unknown) => {
         return await this.handleCardAction(data);
       }) as any,
+      'im.message.reaction.created_v1': (async (data: unknown) => {
+        await this.handleReactionEvent(data);
+      }) as any,
     });
 
     // Create and start WSClient
@@ -262,6 +275,91 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.wsClient.start({ eventDispatcher: dispatcher });
 
     console.log('[feishu-adapter] Started (botOpenId:', this.botOpenId || 'unknown', ')');
+
+    // Warm up p2p channels — after a daemon restart, the Feishu WSClient may
+    // not receive private-chat events until the p2p session is "touched" via
+    // a REST API call.  Fire-and-forget a lightweight im.chat.get for each
+    // known non-group binding so the platform re-associates the WS connection
+    // with those p2p conversations.
+    this.warmP2pChannels().catch(() => {});
+    this.discoverPeerBotsFromGroups().catch(() => {});
+  }
+
+  /**
+   * Touch known p2p chat bindings via REST API so the Feishu platform
+   * resumes pushing private-chat events over the current WS connection.
+   */
+  private async warmP2pChannels(): Promise<void> {
+    if (!this.restClient) return;
+    try {
+      const bindings = getBridgeContext().store.listChannelBindings('feishu');
+      const p2pChats = bindings
+        .filter(b => b.active && b.chatId && !b.chatId.startsWith('oc_'))
+        .map(b => b.chatId);
+      // Group chats always start with "oc_"; anything else is a p2p chat.
+      // However, Feishu p2p chats also use the "oc_" prefix, so fall back to
+      // warming ALL known bindings — the cost is one lightweight GET per chat.
+      const allChats = bindings.filter(b => b.active && b.chatId).map(b => b.chatId);
+      const targets = p2pChats.length > 0 ? p2pChats : allChats;
+      if (targets.length === 0) return;
+
+      console.log(`[feishu-adapter] Warming ${targets.length} chat channel(s)...`);
+      for (const chatId of targets) {
+        try {
+          await this.restClient.im.chat.get({ path: { chat_id: chatId } });
+        } catch {
+          // Non-critical — the chat may have been deleted or bot removed
+        }
+      }
+      console.log(`[feishu-adapter] Warm-up complete (${targets.length} chats)`);
+    } catch (err) {
+      console.warn('[feishu-adapter] p2p warm-up failed:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  /**
+   * Discover peer bots by scanning group member lists at startup.
+   * This ensures we know other bots' open_ids even if we never receive
+   * messages mentioning them (e.g. when the app only gets @-mentioned msgs).
+   */
+  private async discoverPeerBotsFromGroups(): Promise<void> {
+    // Wait for relay server to start (it starts after adapter)
+    await new Promise(resolve => setTimeout(resolve, 3000));
+
+    try {
+      const { getRelayPeerNames, relayToBot } = await import('../bridge-manager.js');
+
+      const myIdentity = JSON.stringify({
+        type: 'identity',
+        name: this.botName,
+        openId: this.botOpenId,
+      });
+
+      // Retry up to 5 times with 3s intervals — peer bot may not be up yet
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const peerNames = getRelayPeerNames();
+        if (peerNames.length === 0 || !this.botOpenId || !this.botName) return;
+
+        let allSent = true;
+        for (const peerName of peerNames) {
+          if (this.knownBots.has(peerName.toLowerCase())) continue; // already known
+          try {
+            const sent = await relayToBot(peerName, '__identity__', myIdentity, this.botName || 'unknown');
+            if (sent) {
+              console.log(`[feishu-adapter] Sent identity to peer: ${peerName}`);
+            } else {
+              allSent = false;
+            }
+          } catch {
+            allSent = false;
+          }
+        }
+        if (allSent) break;
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+    } catch (err) {
+      console.warn('[feishu-adapter] Peer identity exchange failed:', err instanceof Error ? err.message : err);
+    }
   }
 
   async stop(): Promise<void> {
@@ -327,7 +425,22 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   /** Inject a message into the adapter queue (used by relay server). */
   public injectMessage(msg: InboundMessage): void {
+    // If the relay message carries a real Feishu message ID, update
+    // lastIncomingMessageId so the streaming card replies to it.
+    if (msg.messageId && !msg.messageId.startsWith('relay-')) {
+      this.lastIncomingMessageId.set(msg.address.chatId, msg.messageId);
+    }
     this.enqueue(msg);
+  }
+
+  /** Register a peer bot's identity (called via relay identity exchange). */
+  public registerPeerBot(name: string, openId: string): void {
+    if (!name || !openId || this.botIds.has(openId)) return;
+    if (!this.knownBots.has(name.toLowerCase())) {
+      this.knownBots.set(name.toLowerCase(), openId);
+      this.knownBotsByOpenId.set(openId, name);
+      console.log(`[feishu-adapter] Registered peer bot via relay: ${name} -> ${openId}`);
+    }
   }
 
   // ── Typing indicator (Openclaw-style reaction) ─────────────
@@ -406,9 +519,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     try {
       const event = data as any;
-      const value = event?.action?.value ?? {};
-      const callbackData = value.callback_data;
-      if (!callbackData) return FALLBACK_TOAST;
+      const action = event?.action ?? {};
+      const value = action?.value ?? {};
+      const formValue = action?.form_value as Record<string, unknown> | undefined;
+      const actionName = action?.name as string | undefined;
 
       // Extract chat/user context
       const chatId = event?.context?.open_chat_id || value.chatId || '';
@@ -417,13 +531,29 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
       if (!chatId) return FALLBACK_TOAST;
 
+      // Form submission (AskUserQuestion): extract questionId from button name
+      if (formValue && actionName?.startsWith('ask_submit_')) {
+        const questionId = actionName.slice('ask_submit_'.length);
+        const callbackMsg: import('../types.js').InboundMessage = {
+          messageId: messageId || `card_action_${Date.now()}`,
+          address: { channelType: 'feishu', chatId, userId },
+          text: '',
+          timestamp: Date.now(),
+          callbackData: `ask:submit:${questionId}`,
+          callbackMessageId: messageId,
+          formValue,
+        };
+        this.enqueue(callbackMsg);
+        return { toast: { type: 'success' as const, content: '已提交' } };
+      }
+
+      // Regular button callback (permissions etc.)
+      const callbackData = value.callback_data;
+      if (!callbackData) return FALLBACK_TOAST;
+
       const callbackMsg: import('../types.js').InboundMessage = {
         messageId: messageId || `card_action_${Date.now()}`,
-        address: {
-          channelType: 'feishu',
-          chatId,
-          userId,
-        },
+        address: { channelType: 'feishu', chatId, userId },
         text: '',
         timestamp: Date.now(),
         callbackData,
@@ -435,6 +565,69 @@ export class FeishuAdapter extends BaseChannelAdapter {
     } catch (err) {
       console.error('[feishu-adapter] Card action handler error:', err instanceof Error ? err.message : err);
       return FALLBACK_TOAST;
+    }
+  }
+
+  // ── Reaction Event Handler ────────────────────────────────
+
+  private async handleReactionEvent(data: unknown): Promise<void> {
+    const reactionMode = getBridgeContext().store.getSetting('bridge_feishu_reaction_mode') || 'off';
+    if (reactionMode === 'off') return;
+
+    try {
+      // Normalize event shape — SDK may or may not unwrap the envelope
+      const raw = data as any;
+      const ev = raw?.event ?? raw;
+      const messageId = ev?.message_id;
+      const reactorOpenId = ev?.user_id?.open_id;
+      const emojiType = ev?.reaction_type?.emoji_type;
+      const actionTime = ev?.action_time;
+      if (!messageId || !reactorOpenId || !emojiType) return;
+
+      if (this.botIds.has(reactorOpenId)) return;
+      if (emojiType === TYPING_EMOJI) return;
+
+      if (actionTime && this.isTimestampExpired(actionTime)) return;
+
+      // Dedup
+      const dedupKey = `reaction:${messageId}:${emojiType}:${reactorOpenId}`;
+      if (this.seenMessageIds.has(dedupKey)) return;
+      this.seenMessageIds.set(dedupKey, true);
+
+      // Fetch original message to get context
+      if (!this.restClient) return;
+      const res = await this.restClient.im.message.get({
+        path: { message_id: messageId },
+      });
+      const item = (res as any)?.data?.items?.[0];
+      if (!item) return;
+
+      const chatId = item.chat_id;
+      const isGroup = (item.chat_type || 'p2p') === 'group';
+
+      // 'own' mode: only react to reactions on bot's own messages
+      if (reactionMode === 'own') {
+        if (!(item.sender?.sender_type === 'app' && this.botIds.has(item.sender?.id || ''))) return;
+      }
+
+      const reactorName = this.userNameCache.get(reactorOpenId)
+        || await this.resolveUserName(reactorOpenId)
+        || reactorOpenId;
+
+      const excerpt = this.extractPlainText(item).slice(0, 100);
+      const syntheticText = `[${reactorName} reacted with ${emojiType} to: "${excerpt}"]`;
+
+      this.enqueue({
+        messageId: `reaction-${messageId}-${Date.now()}`,
+        address: { channelType: 'feishu', chatId, userId: reactorOpenId },
+        text: syntheticText,
+        timestamp: Date.now(),
+        senderType: 'user',
+        senderName: reactorName,
+        isGroup,
+      });
+    } catch (err) {
+      console.warn('[feishu-adapter] Reaction event handler error:', err instanceof Error ? err.message : err);
     }
   }
 
@@ -495,10 +688,37 @@ export class FeishuAdapter extends BaseChannelAdapter {
       flush: null as any, // set below
       toolHeartbeat: null,
       terminated: false,
+      imageResolver: null,
+      guard: null,
     };
 
     // Create FlushController with performFlush bound to this state
     state.flush = new FlushController(() => this.performFlush(chatId));
+
+    // Create ImageResolver for this card session
+    if (this.restClient) {
+      const { ImageResolver } = await import('../card-image-resolver.js');
+      state.imageResolver = new ImageResolver({
+        restClient: this.restClient,
+        onImageResolved: () => { void state.flush.throttledUpdate(THROTTLE_CONSTANTS.CARDKIT_MS); },
+      });
+    }
+
+    // Create UnavailableGuard for this card session
+    {
+      const { UnavailableGuard } = await import('../unavailable-guard.js');
+      state.guard = new UnavailableGuard({
+        replyToMessageId,
+        getCardMessageId: () => state.messageId,
+        onTerminate: () => {
+          state.terminated = true;
+          if (state.toolHeartbeat) { clearInterval(state.toolHeartbeat); state.toolHeartbeat = null; }
+          state.flush.cancelPendingFlush();
+          this.transitionCard(state, 'error', 'guard.terminated');
+        },
+      });
+    }
+
     this.activeCards.set(chatId, state);
 
     if (!this.transitionCard(state, 'creating', 'createStreamingCard')) {
@@ -564,7 +784,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
       return true;
     } catch (err) {
-      if (isMessageUnavailableError(err)) {
+      if (state.guard?.terminate(err)) {
+        // Guard handles cleanup
+      } else if (isMessageUnavailableError(err)) {
         state.terminated = true;
       }
       console.warn('[feishu-adapter] Failed to create streaming card:', err instanceof Error ? err.message : err);
@@ -581,13 +803,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private async performFlush(chatId: string): Promise<void> {
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient || !state.messageId || TERMINAL_PHASES.has(state.phase)) return;
-
-    // If CardKit streaming was disabled but originalCardId exists,
-    // skip intermediate updates — wait for final update via originalCardId
-    if (!state.cardId && state.originalCardId) return;
+    if (state.guard?.shouldSkip()) return;
 
     try {
-      const displayText = this.buildDisplayText(state);
+      let displayText = this.buildDisplayText(state);
+      // Resolve image URLs to Feishu image keys (async uploads happen in background)
+      if (state.imageResolver) {
+        displayText = state.imageResolver.resolveImages(displayText);
+      }
       const resolvedText = optimizeMarkdownStyle(displayText);
 
       if (state.cardId) {
@@ -600,8 +823,27 @@ export class FeishuAdapter extends BaseChannelAdapter {
           resolvedText,
           state.sequence,
         );
+      } else if (state.originalCardId) {
+        // Fallback: CardKit streaming was disabled (e.g. timeout/table limit),
+        // use full card update via originalCardId to keep progress visible.
+        state.sequence++;
+        const fallbackCard = {
+          schema: '2.0',
+          config: { wide_screen_mode: true },
+          body: {
+            elements: [{
+              tag: 'markdown',
+              content: resolvedText,
+              text_align: 'left',
+              text_size: 'normal_v2',
+              element_id: STREAMING_ELEMENT_ID,
+            }],
+          },
+        };
+        await updateCardKitCard(this.restClient, state.originalCardId, fallbackCard, state.sequence);
       }
     } catch (err: unknown) {
+      if (state.guard?.terminate(err)) return;
       if (isMessageUnavailableError(err)) {
         state.terminated = true;
         this.transitionCard(state, 'error', 'performFlush.unavailable');
@@ -653,8 +895,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private updateCardContent(chatId: string, text: string): void {
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient || TERMINAL_PHASES.has(state.phase) || state.terminated) return;
-
-    // Track reasoning state
+    if (state.guard?.shouldSkip()) return;
     const split = splitReasoningText(text);
     if (split.reasoningText && !split.answerText) {
       // Pure reasoning payload — show thinking content in real-time
@@ -706,7 +947,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (hasRunning && !state.toolHeartbeat) {
       // Start periodic flush to keep elapsed time updated (every 1s)
       state.toolHeartbeat = setInterval(() => {
-        if (TERMINAL_PHASES.has(state.phase) || state.terminated) {
+        if (TERMINAL_PHASES.has(state.phase) || state.terminated || state.guard?.isTerminated) {
           if (state.toolHeartbeat) { clearInterval(state.toolHeartbeat); state.toolHeartbeat = null; }
           return;
         }
@@ -731,6 +972,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     chatId: string,
     status: 'completed' | 'interrupted' | 'error',
     responseText: string,
+    meta?: import('../channel-adapter.js').StreamEndMeta,
   ): Promise<boolean> {
     const pending = this.cardCreatePromises.get(chatId);
     if (pending) {
@@ -739,7 +981,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient) return false;
-    if (TERMINAL_PHASES.has(state.phase) || state.terminated) {
+    if (TERMINAL_PHASES.has(state.phase) || state.terminated || state.guard?.shouldSkip()) {
       this.activeCards.delete(chatId);
       return false;
     }
@@ -759,16 +1001,20 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
         // Step 2: Build and apply final card
         const elapsedMs = Date.now() - state.startTime;
-        const displayText = this.resolveOutboundMentions(
-          responseText || state.completedText || state.accumulatedText || '',
-          'card',
-        );
+        let finalText = responseText || state.completedText || state.accumulatedText || '';
+        // Wait for pending image uploads before final render
+        if (state.imageResolver) {
+          finalText = await state.imageResolver.resolveImagesAwait(finalText, 10_000);
+        }
+        const displayText = this.resolveOutboundMentions(finalText, 'card');
 
         const finalCardJson = buildFinalCardJson(displayText, state.toolCalls, {
           status,
           elapsed: formatElapsed(elapsedMs),
           reasoningText: state.accumulatedReasoningText || undefined,
           reasoningElapsedMs: state.reasoningElapsedMs || undefined,
+          tokenUsage: meta?.tokenUsage || undefined,
+          model: meta?.model || undefined,
         });
 
         state.sequence++;
@@ -833,13 +1079,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.updateToolProgress(chatId, tools);
   }
 
-  async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
-    const result = await this.finalizeCard(chatId, status, responseText);
+  async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string, meta?: import('../channel-adapter.js').StreamEndMeta): Promise<boolean> {
+    // Capture the card's Feishu message ID before finalizeCard cleans up activeCards
+    const cardMessageId = this.activeCards.get(chatId)?.messageId || undefined;
+    const result = await this.finalizeCard(chatId, status, responseText, meta);
 
-    // Multi-bot: relay mentions to peer bots via HTTP
+    // Multi-bot: relay mentions to peer bots via HTTP (group chats only)
     // Match both @[BotName] and @BotName (for known bots)
     const multiBotEnabled = getBridgeContext().store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
-    if (multiBotEnabled && status === 'completed' && responseText) {
+    if (multiBotEnabled && status === 'completed' && responseText && this.groupChatIds.has(chatId)) {
       const { relayToBot, getRelayPeerNames } = await import('../bridge-manager.js');
       const relayedBots = new Set<string>();
 
@@ -863,9 +1111,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
       for (const botName of relayedBots) {
         try {
-          const sent = await relayToBot(botName, chatId, responseText, myName);
+          const sent = await relayToBot(botName, chatId, responseText, myName, cardMessageId);
           if (sent) {
-            console.log(`[feishu-adapter] Relayed to ${botName} via HTTP`);
+            console.log(`[feishu-adapter] Relayed to ${botName} via HTTP (replyMessageId=${cardMessageId})`);
           } else {
             console.warn(`[feishu-adapter] HTTP relay failed for ${botName}`);
           }
@@ -902,7 +1150,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
     }
 
-    // Rendering strategy (aligned with Openclaw):
+    // Raw CardKit JSON (AskUserQuestion forms etc.)
+    if (message.cardJson) {
+      return this.sendRawCard(message.address.chatId, message.cardJson, message.replyToMessageId);
+    }
+
+    // Rendering strategy
     // - Code blocks / tables → interactive card (schema 2.0 markdown)
     // - Other text → post (md tag)
     if (hasComplexMarkdown(text)) {
@@ -1130,26 +1383,45 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Send a raw interactive card JSON to a chat.
    * Used by the pairing adapter for approval cards.
    */
-  async sendRawCard(chatId: string, cardJson: string): Promise<SendResult> {
+  async sendRawCard(chatId: string, cardJson: string, replyToMessageId?: string): Promise<SendResult> {
     if (!this.restClient) {
       return { ok: false, error: 'Feishu client not initialized' };
     }
     try {
-      const receiveIdType = chatId.startsWith('ou_') ? 'open_id' : 'chat_id';
-      const res = await this.restClient.im.message.create({
-        params: { receive_id_type: receiveIdType },
-        data: {
-          receive_id: chatId,
-          msg_type: 'interactive',
-          content: cardJson,
-        },
-      });
+      let res;
+      if (replyToMessageId) {
+        res = await this.restClient.im.message.reply({
+          path: { message_id: replyToMessageId },
+          data: { content: cardJson, msg_type: 'interactive' },
+        });
+      } else {
+        const receiveIdType = chatId.startsWith('ou_') ? 'open_id' : 'chat_id';
+        res = await this.restClient.im.message.create({
+          params: { receive_id_type: receiveIdType },
+          data: { receive_id: chatId, msg_type: 'interactive', content: cardJson },
+        });
+      }
       if (res?.data?.message_id) {
         return { ok: true, messageId: res.data.message_id };
       }
       return { ok: false, error: res?.msg || 'Card send failed' };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : 'Card send failed' };
+    }
+  }
+
+  /** Update an existing card message in-place via PATCH. */
+  async patchCardMessage(messageId: string, cardJson: string): Promise<boolean> {
+    if (!this.restClient) return false;
+    try {
+      await this.restClient.im.message.patch({
+        path: { message_id: messageId },
+        data: { content: cardJson } as any,
+      });
+      return true;
+    } catch (err) {
+      console.warn('[feishu-adapter] patchCardMessage failed:', err instanceof Error ? err.message : err);
+      return false;
     }
   }
 
@@ -1204,6 +1476,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const isBotSender = sender.sender_type === 'bot';
     let contextOnly = false;
 
+    // Diagnostic log for every incoming event
+    console.log(
+      `[feishu-adapter] EVENT msgId=${msg.message_id} chat_type=${msg.chat_type} chat_id=${msg.chat_id}` +
+      ` sender_type=${sender.sender_type} msg_type=${msg.message_type}` +
+      ` mentions=${JSON.stringify(msg.mentions?.map(m => ({ key: m.key, name: m.name, open_id: m.id.open_id })) || [])}` +
+      ` text=${JSON.stringify(msg.content?.slice(0, 200))}`,
+    );
+
     // [P1] Filter bot messages
     if (isBotSender) {
       const multiBotEnabled = getBridgeContext().store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
@@ -1229,6 +1509,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
     }
 
+    // Message expiry: discard messages older than configured threshold
+    if (msg.create_time && this.isTimestampExpired(msg.create_time)) {
+      console.log(`[feishu-adapter] Discarding expired message, msgId: ${msg.message_id}`);
+      return;
+    }
+
     // Dedup by message_id
     if (this.seenMessageIds.has(msg.message_id)) return;
     this.addToDedup(msg.message_id);
@@ -1241,8 +1527,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
       || '';
     const isGroup = msg.chat_type === 'group';
 
+    // Track group chat IDs for relay filtering
+    if (isGroup) this.groupChatIds.add(chatId);
+
     // Track bots observed in this group chat
     if (isGroup) {
+      // Seed user name cache from mentions early (so bot detection can distinguish users)
+      this.seedCacheFromMentions(msg.mentions);
+
       if (isBotSender) {
         const senderBotName = this.knownBotsByOpenId.get(userId);
         if (senderBotName) this.recordBotInGroup(chatId, senderBotName);
@@ -1265,6 +1557,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return;
     }
 
+    // Detect @all mention (before group policy check, used later in InboundMessage)
+    const mentionAll = msg.mentions?.some(m => m.key === '@_all') || false;
+
     // Group chat policy
     if (isGroup) {
       const policy = getBridgeContext().store.getSetting('bridge_feishu_group_policy') || 'open';
@@ -1285,10 +1580,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
         }
       }
 
-      // Require @mention check
+      // Require @mention check (with @all support)
       const requireMention = getBridgeContext().store.getSetting('bridge_feishu_require_mention') !== 'false';
       const botMentioned = this.isBotMentioned(msg.mentions);
-      const isContextOnlyMsg = requireMention && !botMentioned;
+      const respondToMentionAll = getBridgeContext().store.getSetting('bridge_feishu_respond_to_mention_all') === 'true';
+      const effectiveMentioned = botMentioned || (mentionAll && respondToMentionAll);
+      const isContextOnlyMsg = requireMention && !effectiveMentioned;
       if (isContextOnlyMsg) {
         // Multi-bot: store as context instead of dropping
         const multiBotEnabled = getBridgeContext().store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
@@ -1307,11 +1604,44 @@ export class FeishuAdapter extends BaseChannelAdapter {
         }
         // Multi-bot enabled: fall through with contextOnly flag
         contextOnly = true;
+        console.log(`[feishu-adapter] contextOnly=true for msgId=${msg.message_id} (requireMention=${requireMention}, botMentioned=${botMentioned}, multiBotEnabled=${multiBotEnabled})`);
       }
     }
 
+    // ── User name resolution (seed cache from mentions, then batch resolve) ──
+    this.seedCacheFromMentions(msg.mentions);
+    // Await sender name resolution (needed for system prompt label);
+    // batch-resolve mentioned users in background (cosmetic only).
+    if (!isBotSender && !this.userNameCache.has(userId)) {
+      await this.resolveUserName(userId);
+    }
+    const mentionIds = (msg.mentions || [])
+      .map(m => m.id.open_id)
+      .filter((id): id is string => !!id && id !== userId);
+    if (mentionIds.length > 0) {
+      this.batchResolveUserNames(mentionIds).catch(() => {});
+    }
+
+    // ── Chat info resolution (group name, chat mode) ──
+    let groupName: string | undefined;
+    let groupChatMode: string | undefined;
+    if (isGroup) {
+      const chatInfo = await this.resolveChatInfo(chatId);
+      if (chatInfo) {
+        groupName = chatInfo.name || undefined;
+        groupChatMode = chatInfo.chatMode;
+      }
+    }
+
+    // ── Thread ID extraction ──
+    const threadId = msg.root_id || msg.thread_id || undefined;
+
     // Track last message ID per chat for typing indicator
-    this.lastIncomingMessageId.set(chatId, msg.message_id);
+    // Only update for messages that will actually be processed (not contextOnly),
+    // otherwise the streaming card may reply to the wrong message.
+    if (!contextOnly) {
+      this.lastIncomingMessageId.set(chatId, msg.message_id);
+    }
 
     // ── Phase 7: Abort fast-path ──
     // If the message looks like an abort trigger and there is an active
@@ -1322,6 +1652,27 @@ export class FeishuAdapter extends BaseChannelAdapter {
         console.log(`[feishu-adapter] Abort fast-path triggered for chat ${chatId} (text="${rawText}")`);
         this.finalizeCard(chatId, 'interrupted', '').catch(() => {});
         // Still enqueue the message so bridge-manager can handle the abort
+      }
+    }
+
+    // ── Phase 7b: Quote-interrupt ──
+    // If the user replies to the bot's currently streaming card message,
+    // treat it as an interrupt (like /stop) without destroying the session.
+    if (msg.parent_id && this.activeCards.has(chatId)) {
+      const activeState = this.activeCards.get(chatId)!;
+      if (activeState.messageId && activeState.messageId === msg.parent_id) {
+        console.log(`[feishu-adapter] Quote-interrupt triggered for chat ${chatId} (parent_id=${msg.parent_id})`);
+        this.finalizeCard(chatId, 'interrupted', '').catch(() => {});
+        // Enqueue synthetic /stop so bridge-manager aborts the backend task
+        const address = { channelType: 'feishu' as const, chatId, userId };
+        this.enqueue({
+          messageId: msg.message_id,
+          address,
+          text: '/stop',
+          timestamp: parseInt(msg.create_time, 10) || Date.now(),
+          isGroup,
+        });
+        return;
       }
     }
 
@@ -1415,6 +1766,21 @@ export class FeishuAdapter extends BaseChannelAdapter {
         console.log(`[feishu-adapter] Card message with no extractable text, msgId: ${msg.message_id}`);
         return;
       }
+    } else if (messageType === 'merge_forward') {
+      text = await this.parseMergeForward(msg.message_id, msg.content);
+    } else if (messageType === 'sticker') {
+      text = this.parseStickerContent(msg.content);
+    } else if (messageType === 'share_chat') {
+      text = this.parseShareChatContent(msg.content);
+    } else if (messageType === 'share_user') {
+      text = this.parseShareUserContent(msg.content);
+    } else if (messageType === 'location') {
+      text = this.parseLocationContent(msg.content);
+    } else if (['calendar', 'share_calendar_event', 'general_calendar', 'video_chat', 'todo', 'vote'].includes(messageType)) {
+      text = `[${messageType} 消息]`;
+    } else if (['system', 'hongbao', 'folder'].includes(messageType)) {
+      // System/hongbao/folder messages are informational, skip
+      return;
     } else {
       // Unsupported type — log and skip
       console.log(`[feishu-adapter] Unsupported message type: ${messageType}, msgId: ${msg.message_id}`);
@@ -1422,14 +1788,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     // Strip @mention markers from text
-    text = this.resolveMentionMarkers(text, msg.mentions);
+    text = this.resolveMentionMarkers(text, msg.mentions, isGroup ? chatId : undefined);
 
     // Fetch quoted message content if this is a reply
     if (msg.parent_id) {
       const quoted = await this.fetchQuotedMessage(msg.parent_id);
       if (quoted) {
         if (quoted.text) {
-          text = `[引用消息]\n${quoted.text}\n[/引用消息]\n\n${text}`;
+          const quotedLabel = quoted.senderName ? `${quoted.senderName}: ` : '';
+          text = `[引用消息] ${quotedLabel}${quoted.text} [/引用消息]\n\n${text}`;
         }
         if (quoted.attachments) {
           attachments.push(...quoted.attachments);
@@ -1478,10 +1845,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
       timestamp,
       attachments: attachments.length > 0 ? attachments : undefined,
       senderType: isBotSender ? 'bot' : 'user',
-      senderName: isBotSender ? (this.knownBotsByOpenId.get(userId) || userId) : undefined,
+      senderName: isBotSender
+        ? (this.knownBotsByOpenId.get(userId) || userId)
+        : (this.userNameCache.get(userId) || undefined),
       contextOnly: contextOnly || undefined,
       isGroup,
       groupBotNames: groupBotNames && groupBotNames.length > 0 ? groupBotNames : undefined,
+      threadId,
+      mentionAll: mentionAll || undefined,
+      groupName,
+      groupChatMode,
     };
 
     // Audit log
@@ -1507,76 +1880,94 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Fetch the content of a quoted/replied message via Feishu REST API.
    * Returns text and/or attachments from the quoted message.
    */
-  private async fetchQuotedMessage(parentId: string): Promise<{ text?: string; attachments?: FileAttachment[] } | null> {
+  private async fetchQuotedMessage(parentId: string): Promise<{ text?: string; attachments?: FileAttachment[]; senderName?: string } | null> {
     if (!this.restClient) return null;
     try {
       const res = await this.restClient.im.message.get({
         path: { message_id: parentId },
       });
       const item = (res as any)?.data?.items?.[0];
-      if (!item?.body?.content) return null;
-      const msgType = item.msg_type || 'text';
+      if (!item) return null;
 
-      if (msgType === 'text') {
-        return { text: this.parseTextContent(item.body.content) || undefined };
-      }
+      // Resolve quoted message sender name
+      const senderOpenId = item.sender?.id || '';
+      const senderName = senderOpenId
+        ? (this.userNameCache.get(senderOpenId) || await this.resolveUserName(senderOpenId) || undefined)
+        : undefined;
 
-      if (msgType === 'post') {
-        const { extractedText, imageKeys } = this.parsePostContent(item.body.content);
-        const atts: FileAttachment[] = [];
-        for (const key of imageKeys) {
-          const att = await this.downloadResource(item.message_id, key, 'image');
-          if (att) atts.push(att);
-        }
-        return { text: extractedText || undefined, attachments: atts.length > 0 ? atts : undefined };
-      }
-
-      if (msgType === 'image') {
-        const fileKey = this.extractFileKey(item.body.content);
-        if (fileKey) {
-          const att = await this.downloadResource(item.message_id, fileKey, 'image');
-          if (att) return { text: '[引用了一张图片]', attachments: [att] };
-        }
-        return { text: '[引用了一张图片，但下载失败]' };
-      }
-
-      if (msgType === 'file') {
-        const fileKey = this.extractFileKey(item.body.content);
-        if (fileKey) {
-          let fileName: string | undefined;
-          try {
-            const parsed = JSON.parse(item.body.content);
-            fileName = parsed.file_name || parsed.fileName || undefined;
-          } catch { /* ignore */ }
-          const att = await this.downloadResource(item.message_id, fileKey, 'file');
-          if (att) {
-            if (fileName) {
-              att.name = fileName;
-              const ext = fileName.split('.').pop()?.toLowerCase();
-              if (ext === 'pdf') att.type = 'application/pdf';
-              else if (ext === 'txt' || ext === 'md' || ext === 'csv' || ext === 'log') att.type = 'text/plain';
-              else if (ext === 'json') att.type = 'application/json';
-            }
-            return { text: `[引用了文件: ${att.name}]`, attachments: [att] };
-          }
-        }
-        return { text: '[引用了一个文件，但下载失败]' };
-      }
-
-      if (msgType === 'interactive') {
-        const cardText = this.parseCardContent(item.body.content);
-        return { text: cardText || '[引用了一条卡片消息]' };
-      }
-
-      if (msgType === 'audio') return { text: '[引用了一条语音消息]' };
-      if (msgType === 'video') return { text: '[引用了一条视频消息]' };
-      if (msgType === 'media') return { text: '[引用了一条媒体消息]' };
-
-      return null;
+      const result = await this.extractQuotedContent(item);
+      return result ? { ...result, senderName } : null;
     } catch (err) {
       console.warn('[feishu-adapter] Failed to fetch quoted message:', parentId, err);
       return null;
     }
+  }
+
+  /** Extract text/attachments from a fetched message item (used by fetchQuotedMessage). */
+  private async extractQuotedContent(item: any): Promise<{ text?: string; attachments?: FileAttachment[] } | null> {
+    const msgType = item.msg_type || 'text';
+    const content = item.body?.content || '';
+
+    if (msgType === 'text') {
+      return { text: this.parseTextContent(content) || undefined };
+    }
+
+    if (msgType === 'post') {
+      const { extractedText, imageKeys } = this.parsePostContent(content);
+      const atts: FileAttachment[] = [];
+      for (const key of imageKeys) {
+        const att = await this.downloadResource(item.message_id, key, 'image');
+        if (att) atts.push(att);
+      }
+      return { text: extractedText || undefined, attachments: atts.length > 0 ? atts : undefined };
+    }
+
+    if (msgType === 'image') {
+      const fileKey = this.extractFileKey(content);
+      if (fileKey) {
+        const att = await this.downloadResource(item.message_id, fileKey, 'image');
+        if (att) return { text: '[引用了一张图片]', attachments: [att] };
+      }
+      return { text: '[引用了一张图片，但下载失败]' };
+    }
+
+    if (msgType === 'file') {
+      const fileKey = this.extractFileKey(content);
+      if (fileKey) {
+        let fileName: string | undefined;
+        try {
+          const parsed = JSON.parse(content);
+          fileName = parsed.file_name || parsed.fileName || undefined;
+        } catch { /* ignore */ }
+        const att = await this.downloadResource(item.message_id, fileKey, 'file');
+        if (att) {
+          if (fileName) {
+            att.name = fileName;
+            const ext = fileName.split('.').pop()?.toLowerCase();
+            if (ext === 'pdf') att.type = 'application/pdf';
+            else if (ext === 'txt' || ext === 'md' || ext === 'csv' || ext === 'log') att.type = 'text/plain';
+            else if (ext === 'json') att.type = 'application/json';
+          }
+          return { text: `[引用了文件: ${att.name}]`, attachments: [att] };
+        }
+      }
+      return { text: '[引用了一个文件，但下载失败]' };
+    }
+
+    if (msgType === 'interactive') {
+      let cardText = this.parseCardContent(content);
+      // Filter out Feishu's degraded placeholder text
+      if (cardText) {
+        cardText = cardText.replace(/请升级至最新版本客户端[，,]?以查看内容/g, '').trim();
+      }
+      return { text: cardText || '[引用了一条卡片消息，但飞书API不返回卡片原始内容，请直接复制文字发送]' };
+    }
+
+    if (msgType === 'audio') return { text: '[引用了一条语音消息]' };
+    if (msgType === 'video') return { text: '[引用了一条视频消息]' };
+    if (msgType === 'media') return { text: '[引用了一条媒体消息]' };
+
+    return { text: `[引用了一条${msgType}消息]` };
   }
 
   private parseTextContent(content: string): string {
@@ -1654,6 +2045,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const header = parsed.header;
       if (header?.title?.content) {
         parts.push(header.title.content);
+      } else if (typeof parsed.title === 'string' && parsed.title.trim()) {
+        // Feishu API degraded format: title is a plain string
+        parts.push(parsed.title);
       }
 
       // Template card: data.template_variable may contain text fields
@@ -1683,12 +2077,24 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!Array.isArray(elements)) return;
 
     for (const el of elements) {
-      if (!el || typeof el !== 'object') continue;
+      if (!el) continue;
+
+      // Handle nested arrays (e.g. Feishu API returns elements as [[...]])
+      if (Array.isArray(el)) {
+        this.extractCardElements(el, parts);
+        continue;
+      }
+
+      if (typeof el !== 'object') continue;
       const tag = el.tag;
 
       // Direct text content
       if (tag === 'markdown' || tag === 'plain_text' || tag === 'lark_md') {
         if (el.content) parts.push(el.content);
+      } else if (tag === 'text') {
+        // Feishu API degraded card format uses {tag:"text", text:"..."}
+        if (el.text) parts.push(el.text);
+        else if (el.content) parts.push(el.content);
       } else if (tag === 'div') {
         // div can have text field or nested fields
         if (el.text?.content) parts.push(el.text.content);
@@ -1827,18 +2233,22 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return bots ? Array.from(bots) : [];
   }
 
-  /** Auto-discover bots from message mentions. */
+  /** Auto-discover bots from message mentions (called for ALL group messages).
+   *  Skips @all, self, and IDs already known as human users (in userNameCache). */
   private registerBotFromMentions(
     mentions?: FeishuMessageEventData['message']['mentions'],
   ): void {
     if (!mentions) return;
     for (const m of mentions) {
+      if (m.key === '@_all') continue; // Skip @all
       const openId = m.id.open_id;
-      if (openId && !this.botIds.has(openId) && !this.knownBotsByOpenId.has(openId)) {
-        this.knownBots.set(m.name.toLowerCase(), openId);
-        this.knownBotsByOpenId.set(openId, m.name);
-        console.log(`[feishu-adapter] Auto-discovered bot: ${m.name} -> ${openId}`);
-      }
+      if (!openId) continue;
+      if (this.botIds.has(openId)) continue; // Skip self
+      if (this.knownBotsByOpenId.has(openId)) continue; // Already known bot
+      if (this.userNameCache.has(openId)) continue; // Known human user — don't register as bot
+      this.knownBots.set(m.name.toLowerCase(), openId);
+      this.knownBotsByOpenId.set(openId, m.name);
+      console.log(`[feishu-adapter] Auto-discovered bot from mention: ${m.name} -> ${openId}`);
     }
   }
 
@@ -1859,30 +2269,34 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   /**
    * Resolve mention placeholders: strip self-mentions, replace others with @Name.
+   * Also registers unknown mentions as potential bots so outbound @mentions resolve.
+   * False positives (human users) are cleaned up later by unregisterUserFromBots()
+   * once resolveUserName confirms them as real users.
    */
   private resolveMentionMarkers(
     text: string,
     mentions?: FeishuMessageEventData['message']['mentions'],
+    chatId?: string,
   ): string {
     if (!mentions || mentions.length === 0) {
       return text.replace(/@_user_\d+/g, '').trim();
     }
-    // Build a map of placeholder -> display text
     for (const m of mentions) {
+      if (m.key === '@_all') continue;
       const ids = [m.id.open_id, m.id.user_id, m.id.union_id].filter(Boolean) as string[];
       const isSelf = ids.some(id => this.botIds.has(id));
       if (isSelf) {
-        // Strip self-mention
         text = text.replace(new RegExp(escapeRegex(m.key), 'g'), '');
       } else {
-        // Replace with @Name for context
         text = text.replace(new RegExp(escapeRegex(m.key), 'g'), `@${m.name}`);
-        // Auto-discover other bots from mentions
+        // Register as potential bot if not already known (enables outbound @mention resolution).
+        // False positives are cleaned up by unregisterUserFromBots() after user name resolution.
         const openId = m.id.open_id;
-        if (openId && !this.knownBots.has(m.name.toLowerCase())) {
+        if (openId && !this.knownBotsByOpenId.has(openId)) {
           this.knownBots.set(m.name.toLowerCase(), openId);
           this.knownBotsByOpenId.set(openId, m.name);
-          console.log(`[feishu-adapter] Auto-discovered bot from mention: ${m.name} -> ${openId}`);
+          console.log(`[feishu-adapter] Registered mention as potential bot: ${m.name} -> ${openId}`);
+          if (chatId) this.recordBotInGroup(chatId, m.name);
         }
       }
     }
@@ -1893,6 +2307,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Resolve outbound @[BotName] mentions to Feishu mention markup.
    */
   private resolveOutboundMentions(text: string, format: 'post' | 'card' = 'post'): string {
+    if (this.knownBots.size > 0) {
+      console.log(`[feishu-adapter] resolveOutboundMentions: format=${format}, knownBots=[${Array.from(this.knownBots.entries()).map(([n,id]) => `${n}:${id.slice(0,10)}`).join(', ')}], text preview="${text.slice(0, 100)}"`);
+    }
     // First: @[BotName] format
     text = text.replace(/@\[([^\]]+)\]/g, (match, name: string) => {
       const openId = this.knownBots.get(name.toLowerCase());
@@ -1908,6 +2325,17 @@ export class FeishuAdapter extends BaseChannelAdapter {
         ? `<at id=${openId}></at>`
         : `<at user_id="${openId}">${name}</at>`;
       text = text.replace(pattern, replacement);
+    }
+    // Third: @UserName format (from userNameCache, reverse lookup)
+    for (const [openId, userName] of this.userNameCache.entries()) {
+      if (!userName) continue;
+      const pattern = new RegExp(`@${escapeRegex(userName)}(?![\\w\\[])`, 'gi');
+      if (pattern.test(text)) {
+        const replacement = format === 'card'
+          ? `<at id=${openId}></at>`
+          : `<at user_id="${openId}">${userName}</at>`;
+        text = text.replace(pattern, replacement);
+      }
     }
     return text;
   }
@@ -2017,17 +2445,214 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private addToDedup(messageId: string): void {
     this.seenMessageIds.set(messageId, true);
+  }
 
-    // LRU eviction: remove oldest entries when exceeding limit
-    if (this.seenMessageIds.size > DEDUP_MAX) {
-      const excess = this.seenMessageIds.size - DEDUP_MAX;
-      let removed = 0;
-      for (const key of this.seenMessageIds.keys()) {
-        if (removed >= excess) break;
-        this.seenMessageIds.delete(key);
-        removed++;
+  /** Check if a Feishu timestamp (ms string) is older than the configured expiry. */
+  private isTimestampExpired(timestampStr: string): boolean {
+    const expiryMinutes = parseInt(
+      getBridgeContext().store.getSetting('bridge_feishu_message_expiry_minutes') || '30', 10,
+    );
+    if (expiryMinutes <= 0) return false;
+    const age = Date.now() - parseInt(timestampStr, 10);
+    return age > expiryMinutes * 60 * 1000;
+  }
+
+  /** Extract plain text from a message item (best-effort, for excerpts). */
+  private extractPlainText(item: any): string {
+    try {
+      const msgType = item.msg_type || 'text';
+      if (msgType === 'text') return this.parseTextContent(item.body?.content || '');
+      if (msgType === 'post') return this.parsePostContent(item.body?.content || '').extractedText;
+      if (msgType === 'interactive') return this.parseCardContent(item.body?.content || '');
+    } catch { /* best effort */ }
+    return '';
+  }
+
+  // ── User Name Resolution ──────────────────────────────────
+
+  /** Resolve a single user's display name via contact.user.get API. */
+  private async resolveUserName(openId: string): Promise<string | undefined> {
+    const cached = this.userNameCache.get(openId);
+    if (cached !== undefined) return cached || undefined; // '' → undefined
+    if (!this.restClient) return undefined;
+    try {
+      const res = await this.restClient.contact.user.get({
+        path: { user_id: openId },
+        params: { user_id_type: 'open_id' },
+      });
+      const user = (res as any)?.data?.user;
+      const name = user?.name || user?.display_name || user?.nickname || user?.en_name || '';
+      this.userNameCache.set(openId, name); // cache even '' to avoid repeated API calls
+      // If this openId was speculatively registered as a bot, clean it up
+      if (name) this.unregisterUserFromBots(openId);
+      return name || undefined;
+    } catch (err) {
+      console.warn('[feishu-adapter] resolveUserName failed:', openId, err instanceof Error ? err.message : err);
+    }
+    return undefined;
+  }
+
+  /** Remove an openId from knownBots/groupObservedBots if it was confirmed as a human user.
+   *  Called after resolveUserName succeeds — cleans up speculative bot registrations. */
+  private unregisterUserFromBots(openId: string): void {
+    const botName = this.knownBotsByOpenId.get(openId);
+    if (!botName) return;
+    this.knownBotsByOpenId.delete(openId);
+    this.knownBots.delete(botName.toLowerCase());
+    // Remove from all group observed bots
+    for (const [, bots] of this.groupObservedBots) {
+      bots.delete(botName);
+    }
+    console.log(`[feishu-adapter] Unregistered user from bots: ${botName} (${openId}) — confirmed as human user`);
+  }
+
+  /** Batch resolve user names via contact/v3/users/batch (chunks of 50). */
+  private async batchResolveUserNames(openIds: string[]): Promise<void> {
+    if (!this.restClient) return;
+    const unresolved = this.userNameCache.filterMissing(openIds);
+    if (unresolved.length === 0) return;
+    const unique = [...new Set(unresolved)];
+    for (let i = 0; i < unique.length; i += 50) {
+      const chunk = unique.slice(i, i + 50);
+      try {
+        const res = await (this.restClient.contact.user as any).batch({
+          params: { user_ids: chunk, user_id_type: 'open_id' },
+        });
+        const items = (res as any)?.data?.items || [];
+        for (const item of items) {
+          const id = item.user_id || item.open_id;
+          const name = item.name || item.display_name || item.nickname || item.en_name || '';
+          if (id) {
+            this.userNameCache.set(id, name);
+            if (name) this.unregisterUserFromBots(id);
+          }
+        }
+        // Cache empty for IDs the API didn't return
+        for (const id of chunk) {
+          if (!this.userNameCache.has(id)) this.userNameCache.set(id, '');
+        }
+      } catch (err) {
+        console.warn('[feishu-adapter] batchResolveUserNames failed:', err instanceof Error ? err.message : err);
+        // Fallback: resolve individually
+        for (const id of chunk) {
+          if (!this.userNameCache.has(id)) await this.resolveUserName(id);
+        }
       }
     }
+  }
+
+  /** Seed user name cache from mention payloads (free, no API call). */
+  private seedCacheFromMentions(mentions?: FeishuMessageEventData['message']['mentions']): void {
+    if (!mentions) return;
+    for (const m of mentions) {
+      if (m.key === '@_all') continue;
+      const openId = m.id.open_id;
+      if (!openId || !m.name) continue;
+      if (this.botIds.has(openId)) continue; // Skip self
+      if (!this.userNameCache.has(openId)) {
+        this.userNameCache.set(openId, m.name);
+      }
+    }
+  }
+
+  // ── Chat Info Resolution ──────────────────────────────────
+
+  /** Resolve group chat info via im.chat.get API, cache result. */
+  private async resolveChatInfo(chatId: string): Promise<{ name: string; chatMode?: string; groupMessageType?: string } | undefined> {
+    const cached = this.chatInfoCache.get(chatId);
+    if (cached !== undefined) return cached;
+    if (!this.restClient) return undefined;
+    try {
+      const res = await this.restClient.im.chat.get({ path: { chat_id: chatId } });
+      const data = (res as any)?.data;
+      if (data) {
+        const info = {
+          name: data.name || '',
+          chatMode: data.chat_mode as string | undefined,
+          groupMessageType: data.group_message_type as string | undefined,
+        };
+        this.chatInfoCache.set(chatId, info);
+        return info;
+      }
+    } catch (err) {
+      console.warn('[feishu-adapter] resolveChatInfo failed:', chatId, err instanceof Error ? err.message : err);
+    }
+    return undefined;
+  }
+
+  // ── Message Type Converters ───────────────────────────────
+
+  /** Parse merge_forward (forwarded message bundle) — expand sub-messages with sender attribution. */
+  private async parseMergeForward(messageId: string, content: string): Promise<string> {
+    if (!this.restClient) return '[转发消息，无法展开]';
+    try {
+      // merge_forward content may contain inline message list or require API fetch
+      let items: any[] | undefined;
+      try {
+        const parsed = JSON.parse(content);
+        // Some merge_forward payloads embed messages directly
+        items = parsed.message_list || parsed.messages || parsed.items;
+      } catch { /* not inline, fetch via API */ }
+
+      if (!items || items.length === 0) {
+        const res = await this.restClient.im.message.get({
+          path: { message_id: messageId },
+        });
+        items = (res as any)?.data?.items;
+      }
+      if (!items || items.length === 0) return '[转发消息，无内容]';
+
+      // Batch resolve sender names
+      const senderIds = items.map((it: any) => it.sender?.id).filter(Boolean) as string[];
+      if (senderIds.length > 0) await this.batchResolveUserNames(senderIds);
+
+      const lines: string[] = ['<forwarded_messages>'];
+      for (const item of items.slice(0, 20)) {
+        const senderId = item.sender?.id || '';
+        const senderName = this.userNameCache.get(senderId) || senderId;
+        const createTime = item.create_time
+          ? new Date(parseInt(item.create_time, 10)).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
+          : '';
+        const subText = this.extractPlainText(item) || `[${item.msg_type || 'unknown'}]`;
+        lines.push(`[${createTime}] ${senderName}: ${subText}`);
+      }
+      lines.push('</forwarded_messages>');
+      return lines.join('\n');
+    } catch (err) {
+      console.warn('[feishu-adapter] parseMergeForward failed:', err instanceof Error ? err.message : err);
+      return '[转发消息，展开失败]';
+    }
+  }
+
+  private parseStickerContent(content: string): string {
+    try {
+      const parsed = JSON.parse(content);
+      return `[表情: ${parsed.sticker_id || 'unknown'}]`;
+    } catch { return '[表情]'; }
+  }
+
+  private parseShareChatContent(content: string): string {
+    try {
+      const parsed = JSON.parse(content);
+      return `[分享群聊: ${parsed.chat_id || 'unknown'}]`;
+    } catch { return '[分享群聊]'; }
+  }
+
+  private parseShareUserContent(content: string): string {
+    try {
+      const parsed = JSON.parse(content);
+      return `[分享联系人: ${parsed.user_id || 'unknown'}]`;
+    } catch { return '[分享联系人]'; }
+  }
+
+  private parseLocationContent(content: string): string {
+    try {
+      const parsed = JSON.parse(content);
+      const name = parsed.name || '';
+      const lat = parsed.latitude || '';
+      const lng = parsed.longitude || '';
+      return `[位置: ${name} (${lat}, ${lng})]`;
+    } catch { return '[位置]'; }
   }
 }
 

@@ -200,6 +200,14 @@ export class JsonFileStore implements BridgeStore {
     return this.settings.get(key) ?? null;
   }
 
+  setSetting(key: string, value: string): void {
+    if (value) {
+      this.settings.set(key, value);
+    } else {
+      this.settings.delete(key);
+    }
+  }
+
   // ── Channel Bindings ──
 
   getChannelBinding(channelType: string, chatId: string): ChannelBinding | null {
@@ -213,6 +221,8 @@ export class JsonFileStore implements BridgeStore {
       const updated: ChannelBinding = {
         ...existing,
         codepilotSessionId: data.codepilotSessionId,
+        // Allow callers to reset sdkSessionId (e.g. /new command passes '')
+        sdkSessionId: 'sdkSessionId' in data ? (data.sdkSessionId ?? existing.sdkSessionId) : existing.sdkSessionId,
         workingDirectory: data.workingDirectory,
         model: data.model,
         updatedAt: now(),

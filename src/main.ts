@@ -130,7 +130,7 @@ async function main(): Promise<void> {
   console.log(`[claude-to-im] Runtime: ${config.runtime}`);
 
   const gateway = {
-    resolvePendingPermission: (id: string, resolution: { behavior: 'allow' | 'deny'; message?: string }) =>
+    resolvePendingPermission: (id: string, resolution: { behavior: 'allow' | 'deny'; message?: string; updatedInput?: Record<string, unknown> }) =>
       pendingPerms.resolve(id, resolution),
   };
 
@@ -138,6 +138,7 @@ async function main(): Promise<void> {
     store,
     llm,
     permissions: gateway,
+    runtime: config.runtime,
     lifecycle: {
       onBridgeStart: () => {
         // Write authoritative PID from the actual process (not shell $!)
@@ -160,6 +161,34 @@ async function main(): Promise<void> {
   });
 
   await bridgeManager.start();
+
+  // OAuth Device Flow — obtain user_access_token for lark-mcp
+  let oauthManager: import('./oauth/oauth-manager.js').OAuthManager | null = null;
+  if (config.feishuOAuthEnabled && config.feishuAppId && config.feishuAppSecret) {
+    const adminChatId = config.feishuOAuthAdminChatId;
+    if (adminChatId) {
+      const { OAuthManager } = await import('./oauth/oauth-manager.js');
+      const state = bridgeManager.getState();
+      const adapter = state.adapters.get('feishu') as any;
+      oauthManager = new OAuthManager(
+        {
+          appId: config.feishuAppId,
+          appSecret: config.feishuAppSecret,
+          domain: `https://${config.feishuDomain === 'lark.com' ? 'open.larksuite.com' : 'open.feishu.cn'}`,
+          ctiHome: CTI_HOME,
+          adminChatId,
+          scope: config.feishuOAuthScope,
+        },
+        async (chatId, cardJson) => { adapter?.sendRawCard?.(chatId, cardJson); },
+        async (messageId, cardJson) => { adapter?.patchCardMessage?.(messageId, cardJson); },
+      );
+      await oauthManager.ensureAuth();
+      oauthManager.startRefreshTimer();
+      console.log('[claude-to-im] OAuth manager initialized');
+    } else {
+      console.warn('[claude-to-im] OAuth enabled but CTI_FEISHU_OAUTH_ADMIN_CHAT_ID not set');
+    }
+  }
 
   // Periodic cleanup of expired dedup keys
   const dedupCleanupInterval = setInterval(() => {

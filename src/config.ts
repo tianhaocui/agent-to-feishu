@@ -28,6 +28,20 @@ export interface Config {
   forwardUnknownCommands?: boolean;
   // Auto-approve all tool permission requests without user confirmation
   autoApprove?: boolean;
+  // Thread session isolation for topic groups
+  feishuThreadSession?: boolean;
+  // Per-group config JSON: { "oc_xxx": { "systemPrompt": "..." } }
+  feishuGroupConfig?: string;
+  // Respond to @all mentions in groups
+  feishuRespondToMentionAll?: boolean;
+  // Reaction event mode: 'off' | 'own' | 'all'
+  feishuReactionMode?: string;
+  // Discard messages older than N minutes (default 30)
+  feishuMessageExpiryMinutes?: number;
+  // OAuth Device Flow
+  feishuOAuthEnabled?: boolean;
+  feishuOAuthAdminChatId?: string;
+  feishuOAuthScope?: string;
 }
 
 export const CTI_HOME = process.env.CTI_HOME || path.join(os.homedir(), ".claude-to-im");
@@ -124,6 +138,16 @@ export function loadConfig(): Config {
       ? env.get("CTI_FORWARD_UNKNOWN_COMMANDS") !== "false"
       : true,
     autoApprove: env.get("CTI_AUTO_APPROVE") === "true",
+    feishuThreadSession: env.get("CTI_FEISHU_THREAD_SESSION") === "true",
+    feishuGroupConfig: env.get("CTI_FEISHU_GROUP_CONFIG") || undefined,
+    feishuRespondToMentionAll: env.get("CTI_FEISHU_RESPOND_TO_MENTION_ALL") === "true",
+    feishuReactionMode: env.get("CTI_FEISHU_REACTION_MODE") || undefined,
+    feishuMessageExpiryMinutes: env.has("CTI_FEISHU_MESSAGE_EXPIRY_MINUTES")
+      ? parseInt(env.get("CTI_FEISHU_MESSAGE_EXPIRY_MINUTES")!, 10)
+      : undefined,
+    feishuOAuthEnabled: env.get("CTI_FEISHU_OAUTH_ENABLED") === "true",
+    feishuOAuthAdminChatId: env.get("CTI_FEISHU_OAUTH_ADMIN_CHAT_ID") || undefined,
+    feishuOAuthScope: env.get("CTI_FEISHU_OAUTH_SCOPE") || undefined,
   };
 }
 
@@ -236,6 +260,16 @@ export function configToSettings(config: Config): Map<string, string> {
     m.set("bridge_relay_peers", config.relayPeers.map(p => `${p.name}:${p.host}:${p.port}`).join(","));
   if (config.forwardUnknownCommands !== undefined)
     m.set("bridge_forward_unknown_commands", String(config.forwardUnknownCommands));
+  if (config.feishuThreadSession)
+    m.set("bridge_feishu_thread_session", "true");
+  if (config.feishuGroupConfig)
+    m.set("bridge_feishu_group_config", config.feishuGroupConfig);
+  if (config.feishuRespondToMentionAll)
+    m.set("bridge_feishu_respond_to_mention_all", "true");
+  if (config.feishuReactionMode)
+    m.set("bridge_feishu_reaction_mode", config.feishuReactionMode);
+  if (config.feishuMessageExpiryMinutes !== undefined)
+    m.set("bridge_feishu_message_expiry_minutes", String(config.feishuMessageExpiryMinutes));
 
   // ── Defaults ──
   m.set("bridge_default_work_dir", config.defaultWorkDir);

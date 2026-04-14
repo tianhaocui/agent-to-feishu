@@ -7,7 +7,7 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
-import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
+import type { BridgeStatus, ChannelBinding, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
 // Side-effect import: triggers self-registration of all adapter factories
@@ -146,7 +146,7 @@ interface BridgeManagerState {
   autoStartChecked: boolean;
 }
 
-function getState(): BridgeManagerState {
+export function getState(): BridgeManagerState {
   const g = globalThis as unknown as Record<string, BridgeManagerState>;
   if (!g[GLOBAL_KEY]) {
     g[GLOBAL_KEY] = {
@@ -435,11 +435,88 @@ async function handleMessage(
     }
   };
 
-  // Handle callback queries (permission buttons)
+  // Handle callback queries (permission buttons + form submissions)
   if (msg.callbackData) {
+    // AskUserQuestion form submission: ask:submit:<questionId>
+    if (msg.callbackData.startsWith('ask:submit:') && msg.formValue) {
+      const questionId = msg.callbackData.slice('ask:submit:'.length);
+      const { permissions, store } = getBridgeContext();
+
+      // Look up the stored question metadata
+      const link = store.getPermissionLink(questionId);
+      let questions: Array<{ question: string; options?: Array<{ label: string; description?: string }>; multiSelect?: boolean }> = [];
+      if (link?.suggestions) {
+        try {
+          const parsed = JSON.parse(link.suggestions);
+          if (parsed.questions) {
+            questions = parsed.questions;
+          } else if (parsed.questionText && parsed.options) {
+            // Legacy format from numeric shortcut fallback
+            questions = [{ question: parsed.questionText, options: parsed.options.map((l: string) => ({ label: l })) }];
+          }
+        } catch { /* ignore */ }
+      }
+
+      // Parse form values into answers
+      console.log(`[bridge-manager] AskUserQuestion formValue=${JSON.stringify(msg.formValue)}, questions count=${questions.length}, link.suggestions=${link?.suggestions?.slice(0, 200)}`);
+      const answers: Record<string, string> = {};
+      for (let i = 0; i < questions.length; i++) {
+        const q = questions[i];
+        const rawValue = msg.formValue[`q_${i}`];
+        if (rawValue === undefined || rawValue === null) continue;
+
+        // Check if user typed a custom answer (takes priority over dropdown)
+        const customKey = `q_${i}_custom`;
+        const customValue = msg.formValue[customKey];
+        if (typeof customValue === 'string' && customValue.trim()) {
+          answers[q.question] = customValue.trim();
+          continue;
+        }
+
+        if (q.multiSelect && Array.isArray(rawValue)) {
+          // Multi-select: values are "opt_N_label", extract labels
+          const labels = rawValue.map((v: string) => v.replace(/^opt_\d+_/, ''));
+          answers[q.question] = labels.join(', ');
+        } else if (typeof rawValue === 'string') {
+          if (rawValue.startsWith('opt_')) {
+            // Single-select: "opt_N_label"
+            answers[q.question] = rawValue.replace(/^opt_\d+_/, '');
+          } else {
+            // Free-text input
+            answers[q.question] = rawValue;
+          }
+        }
+      }
+
+      console.log(`[bridge-manager] AskUserQuestion form submitted: questionId=${questionId}, answers=${JSON.stringify(answers)}`);
+
+      const resolved = permissions.resolvePendingPermission(questionId, {
+        behavior: 'allow',
+        updatedInput: { answers },
+      });
+
+      console.log(`[bridge-manager] AskUserQuestion resolved=${resolved}, link=${link ? `messageId=${link.messageId}` : 'null'}, hasPatch=${typeof (adapter as any).patchCardMessage}`);
+
+      if (resolved) {
+        try { store.markPermissionLinkResolved(questionId); } catch { /* best effort */ }
+        // Update original card to "answered" (collapsed) state
+        if (link?.messageId && adapter.patchCardMessage) {
+          try {
+            const { buildAskUserAnsweredCard } = await import('./markdown/feishu.js');
+            const answeredCardJson = buildAskUserAnsweredCard(questions, answers);
+            await adapter.patchCardMessage(link.messageId, answeredCardJson);
+          } catch (err) {
+            console.warn('[bridge-manager] Failed to update AskUserQuestion card:', err instanceof Error ? err.message : err);
+          }
+        }
+      }
+
+      ack();
+      return;
+    }
+
     const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
     if (handled) {
-      // Send confirmation
       const confirmMsg: OutboundMessage = {
         address: msg.address,
         text: 'Permission response recorded.',
@@ -572,6 +649,13 @@ async function handleMessage(
     }
   }
 
+  // Context-only messages: skip processing entirely (check before command dispatch)
+  if (msg.contextOnly) {
+    console.log(`[bridge-manager] contextOnly FILTERED: msgId=${msg.messageId} chatId=${msg.address.chatId} text=${JSON.stringify(msg.text?.slice(0, 100))}`);
+    ack();
+    return;
+  }
+
   // Check for IM commands (before sanitization — commands are validated individually)
   if (rawText.startsWith('/')) {
     await handleCommand(adapter, msg, rawText);
@@ -594,12 +678,6 @@ async function handleMessage(
 
   if (!text && !hasAttachments) { ack(); return; }
 
-  // Context-only messages: skip processing entirely
-  if (msg.contextOnly) {
-    ack();
-    return;
-  }
-
   await processRegularMessage(adapter, msg, text, hasAttachments);
 }
 
@@ -614,6 +692,12 @@ async function processRegularMessage(
   hasAttachments?: boolean,
 ): Promise<void> {
   const { store } = getBridgeContext();
+
+  // Thread session isolation: use composite key for topic groups
+  const threadSessionEnabled = store.getSetting('bridge_feishu_thread_session') === 'true';
+  if (threadSessionEnabled && msg.threadId && msg.isGroup && msg.groupChatMode === 'topic') {
+    msg.address = { ...msg.address, chatId: `${msg.address.chatId}:thread:${msg.threadId}` };
+  }
 
   // Regular message — route to conversation engine
   const binding = router.resolve(msg.address);
@@ -740,7 +824,10 @@ async function processRegularMessage(
       if (multiBotEnabled && msg.senderType === 'bot' && msg.senderName) {
         promptText = `[来自机器人: ${msg.senderName}]\n${promptText}`;
       }
-      chatContext = `[群聊环境] 这是飞书群聊。发送者: ${senderLabel}。`;
+      const groupLabel = msg.groupName ? `「${msg.groupName}」` : '';
+      const myBotName = adapter.botName || '';
+      const myBotLabel = myBotName ? `你在飞书中的机器人名字是「${myBotName}」。` : '';
+      chatContext = `[群聊环境] 这是飞书群聊${groupLabel}。${myBotLabel}发送者: ${senderLabel}。`;
       if (multiBotEnabled) {
         const peerNames = msg.groupBotNames && msg.groupBotNames.length > 0
           ? msg.groupBotNames
@@ -748,11 +835,20 @@ async function processRegularMessage(
         const peerList = peerNames.length > 0 ? `群里的其他机器人: ${peerNames.join(', ')}。` : '';
         if (peerNames.length > 0) {
           chatContext += peerList
-            + `重要：其他机器人不会自动看到你的回复。如果你需要某个机器人回应你，必须在回复中写 @[机器人名]（如 @[${peerNames[0]}]）来触发对方，否则对方不会收到你的消息。`;
+            + `重要：其他机器人不会自动看到你的回复。如果你需要某个机器人回应你，必须在回复中写 @机器人名（如 @${peerNames[0]}）来触发对方，否则对方不会收到你的消息。`;
         }
         // When replying to a bot message, remind to @ the sender specifically
         if (msg.senderType === 'bot' && msg.senderName) {
-          chatContext += `\n\n当前消息来自机器人「${msg.senderName}」。你的回复必须包含 @[${msg.senderName}] 否则对方收不到。`;
+          chatContext += `\n\n当前消息来自机器人「${msg.senderName}」。你的回复必须包含 @${msg.senderName} 否则对方收不到。`;
+        }
+      }
+      // Per-group system prompt from config
+      const groupConfig = getGroupConfig(store);
+      if (groupConfig) {
+        const originalChatId = msg.address.chatId.split(':thread:')[0];
+        const chatConfig = groupConfig[originalChatId] || groupConfig[msg.address.chatId];
+        if (chatConfig?.systemPrompt) {
+          chatContext += `\n\n${chatConfig.systemPrompt}`;
         }
       }
     } else {
@@ -771,7 +867,7 @@ async function processRegularMessage(
         msg.messageId,
       );
     }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent,
-    // onAskUserQuestion — forward to IM with option buttons
+    // onAskUserQuestion — forward to IM with interactive form card
     async (question) => {
       const { permissions } = getBridgeContext();
       try {
@@ -785,32 +881,55 @@ async function processRegularMessage(
         const questions = input.questions || [];
         if (questions.length === 0) return;
 
-        for (const q of questions) {
-          const options = q.options || [];
-          const lines = [`**${q.question}**`];
-          for (let i = 0; i < options.length; i++) {
-            lines.push(`${i + 1}. ${options[i].label}${options[i].description ? ` — ${options[i].description}` : ''}`);
-          }
+        // Build and send interactive form card
+        const { buildAskUserQuestionCard } = await import('./markdown/feishu.js');
+        const cardJson = buildAskUserQuestionCard(question.questionId, questions);
 
-          const outMsg: OutboundMessage = {
+        const outMsg: OutboundMessage = {
+          address: msg.address,
+          text: '',
+          cardJson,
+          replyToMessageId: msg.messageId,
+        };
+
+        const result = await deliver(adapter, outMsg, { sessionId: binding.codepilotSessionId });
+
+        if (result.ok && result.messageId) {
+          try {
+            const { store } = getBridgeContext();
+            // Store question metadata for form submit handling
+            store.insertPermissionLink({
+              permissionRequestId: question.questionId,
+              channelType: adapter.channelType,
+              chatId: msg.address.chatId,
+              messageId: result.messageId,
+              toolName: 'AskUserQuestion',
+              suggestions: JSON.stringify({ questions }),
+            });
+          } catch { /* best effort */ }
+        }
+
+        // Also send a plain-text fallback hint for numeric shortcuts
+        if (questions.length === 1 && questions[0].options && questions[0].options.length > 0) {
+          const q = questions[0];
+          const lines = q.options!.map((opt, i) => `${i + 1}. ${opt.label}`);
+          const fallbackMsg: OutboundMessage = {
             address: msg.address,
-            text: lines.join('\n'),
+            text: `💡 也可以直接回复数字：\n${lines.join('\n')}`,
             parseMode: 'plain',
-            replyToMessageId: msg.messageId,
           };
-
-          const result = await deliver(adapter, outMsg, { sessionId: binding.codepilotSessionId });
-
-          if (result.ok && result.messageId) {
+          const fallbackResult = await deliver(adapter, fallbackMsg, { sessionId: binding.codepilotSessionId });
+          // Link the fallback message for numeric shortcut resolution (use separate ID to avoid overwriting form link)
+          if (fallbackResult.ok && fallbackResult.messageId) {
             try {
               const { store } = getBridgeContext();
               store.insertPermissionLink({
-                permissionRequestId: question.questionId,
+                permissionRequestId: `${question.questionId}_fallback`,
                 channelType: adapter.channelType,
                 chatId: msg.address.chatId,
-                messageId: result.messageId,
+                messageId: fallbackResult.messageId,
                 toolName: 'AskUserQuestion',
-                suggestions: JSON.stringify({ questionText: q.question, options: options.map(o => o.label) }),
+                suggestions: JSON.stringify({ questionText: q.question, options: q.options!.map(o => o.label) }),
               });
             } catch { /* best effort */ }
           }
@@ -829,9 +948,18 @@ async function processRegularMessage(
     // was actually finalized (meaning content is already visible to the user).
     let cardFinalized = false;
     if (hasStreamingCards && adapter.onStreamEnd) {
+      const meta = {
+        tokenUsage: result.tokenUsage ? {
+          input: result.tokenUsage.input_tokens ?? 0,
+          output: result.tokenUsage.output_tokens ?? 0,
+          cacheRead: result.tokenUsage.cache_read_input_tokens ?? undefined,
+          cacheCreation: result.tokenUsage.cache_creation_input_tokens ?? undefined,
+        } : undefined,
+        model: result.model || undefined,
+      };
       try {
         const status = result.hasError ? 'error' : 'completed';
-        cardFinalized = await adapter.onStreamEnd(msg.address.chatId, status, result.responseText);
+        cardFinalized = await adapter.onStreamEnd(msg.address.chatId, status, result.responseText, meta);
       } catch (err) {
         console.warn('[bridge-manager] Card finalize failed:', err instanceof Error ? err.message : err);
       }
@@ -905,6 +1033,23 @@ async function forwardToAI(
 /** Commands that forward their args to the AI CLI. */
 const FORWARD_COMMANDS = new Set(['/ask', '/run', '/code']);
 
+/** Cached parsed group config (avoids JSON.parse on every group message). */
+let _groupConfigRaw: string | null = null;
+let _groupConfigParsed: Record<string, any> | null = null;
+function getGroupConfig(store: { getSetting(key: string): string | null }): Record<string, any> | null {
+  const raw = store.getSetting('bridge_feishu_group_config');
+  if (!raw) return null;
+  if (raw === _groupConfigRaw) return _groupConfigParsed;
+  try {
+    _groupConfigParsed = JSON.parse(raw);
+    _groupConfigRaw = raw;
+  } catch {
+    _groupConfigParsed = null;
+    _groupConfigRaw = raw;
+  }
+  return _groupConfigParsed;
+}
+
 /**
  * Handle IM slash commands.
  */
@@ -972,6 +1117,7 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
         '/mode plan|code|ask - Change mode',
+        '/model &lt;name&gt; - Switch model (e.g. sonnet, opus)',
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
@@ -1033,7 +1179,9 @@ async function handleCommand(
         break;
       }
       const binding = router.resolve(msg.address);
-      router.updateBinding(binding.id, { workingDirectory: validatedPath });
+      // Clear sdkSessionId so the next message starts a fresh CLI session
+      // in the new directory instead of trying to resume the old one.
+      router.updateBinding(binding.id, { workingDirectory: validatedPath, sdkSessionId: '' });
       response = `Working directory set to <code>${escapeHtml(validatedPath)}</code>`;
       break;
     }
@@ -1046,6 +1194,41 @@ async function handleCommand(
       const binding = router.resolve(msg.address);
       router.updateBinding(binding.id, { mode: args });
       response = `Mode set to <b>${args}</b>`;
+      break;
+    }
+
+    case '/model': {
+      const binding = router.resolve(msg.address);
+      if (!args) {
+        const rt = getBridgeContext().runtime;
+        const lines = [`Current model: <code>${binding.model || 'default'}</code>`];
+        if (rt === 'codex') {
+          lines.push(`Available: <code>o3</code> | <code>o4-mini</code> | <code>gpt-4.1</code> | <code>codex-mini</code>`);
+        } else {
+          lines.push(
+            `Available:`,
+            `  <code>sonnet</code>  <code>opus</code>  <code>haiku</code>`,
+            `  <code>sonnet[1m]</code>  <code>opus[1m]</code>  (1M context)`,
+          );
+        }
+        lines.push(`Usage: /model &lt;name&gt; · /model default to reset.`);
+        response = lines.join('\n');
+        break;
+      }
+      const modelName = args.toLowerCase() === 'default' ? '' : args.trim();
+      // Claude Code supports resuming a session with a different model,
+      // so we keep sdkSessionId intact. Codex does not — clear it to force a new thread.
+      const rt = getBridgeContext().runtime;
+      const needsNewSession = rt === 'codex';
+      const updates: Partial<ChannelBinding> = { model: modelName };
+      if (needsNewSession) {
+        updates.sdkSessionId = '';
+      }
+      router.updateBinding(binding.id, updates);
+      const suffix = needsNewSession ? ' Next message will use a new session.' : ' Session preserved.';
+      response = modelName
+        ? `Model set to <code>${escapeHtml(modelName)}</code>.${suffix}`
+        : `Model reset to <b>default</b>.${suffix}`;
       break;
     }
 
@@ -1111,6 +1294,28 @@ async function handleCommand(
       break;
     }
 
+    case '/think': {
+      const levels = ['low', 'medium', 'high', 'max', 'off'];
+      if (!args || !levels.includes(args.toLowerCase())) {
+        const current = store.getSetting('bridge_thinking_effort') || 'adaptive (default)';
+        response = `Current: <b>${current}</b>\nUsage: /think low|medium|high|max|off`;
+        break;
+      }
+      if (!store.setSetting) {
+        response = 'This store does not support runtime settings.';
+        break;
+      }
+      const level = args.toLowerCase();
+      if (level === 'off') {
+        store.setSetting('bridge_thinking_effort', '');
+        response = 'Thinking effort reset to <b>adaptive</b> (model decides).';
+      } else {
+        store.setSetting('bridge_thinking_effort', level);
+        response = `Thinking effort set to <b>${level}</b>.`;
+      }
+      break;
+    }
+
     case '/help':
       response = [
         '<b>CodePilot Bridge Commands</b>',
@@ -1128,6 +1333,7 @@ async function handleCommand(
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
+        '/think low|medium|high|max|off - Set thinking effort',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
         '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
         '/help - Show this help',
@@ -1232,11 +1438,30 @@ export function startRelayServer(): void {
 
     try {
       const data = JSON.parse(body);
-      const { chatId, text, senderName, senderType } = data;
+      const { chatId, text, senderName, senderType, replyMessageId } = data;
       if (!chatId || !text) {
         res.writeHead(400);
         res.end('Missing chatId or text');
         return;
+      }
+
+      // Handle identity exchange: peer bot announces its name + openId
+      if (chatId === '__identity__') {
+        try {
+          const identity = JSON.parse(text);
+          if (identity.type === 'identity' && identity.name && identity.openId) {
+            const state = getState();
+            for (const [, adapter] of state.adapters) {
+              if ('registerPeerBot' in adapter && typeof (adapter as any).registerPeerBot === 'function') {
+                (adapter as any).registerPeerBot(identity.name, identity.openId);
+              }
+            }
+            console.log(`[relay-server] Registered peer identity: ${identity.name} -> ${identity.openId}`);
+            res.writeHead(200);
+            res.end('OK');
+            return;
+          }
+        } catch { /* fall through to normal relay */ }
       }
 
       // Find the first available adapter and inject the message
@@ -1245,7 +1470,7 @@ export function startRelayServer(): void {
       for (const [, adapter] of state.adapters) {
         if (adapter.injectMessage) {
           const msg: InboundMessage = {
-            messageId: `relay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            messageId: replyMessageId || `relay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             address: { channelType: adapter.channelType, chatId },
             text,
             timestamp: Date.now(),
@@ -1294,14 +1519,14 @@ export function getRelayPeerNames(): string[] {
  * Send a relay message to a peer bot by name.
  * Returns true if the message was sent successfully.
  */
-export async function relayToBot(botName: string, chatId: string, text: string, senderName: string): Promise<boolean> {
+export async function relayToBot(botName: string, chatId: string, text: string, senderName: string, replyMessageId?: string): Promise<boolean> {
   const peer = relayPeers.get(botName.toLowerCase());
   if (!peer) {
     console.warn(`[relay-server] Unknown peer bot: ${botName}`);
     return false;
   }
 
-  const payload = JSON.stringify({ chatId, text, senderName, senderType: 'bot' });
+  const payload = JSON.stringify({ chatId, text, senderName, senderType: 'bot', replyMessageId });
 
   return new Promise<boolean>((resolve) => {
     const req = http.request({

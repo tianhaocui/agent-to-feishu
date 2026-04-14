@@ -105,6 +105,10 @@ export class FeishuPairingAdapter extends BaseChannelAdapter {
     return this.inner.editMessage ? this.inner.editMessage(messageId, text) : Promise.resolve(false);
   }
 
+  patchCardMessage(messageId: string, cardJson: string): Promise<boolean> {
+    return this.inner.patchCardMessage ? this.inner.patchCardMessage(messageId, cardJson) : Promise.resolve(false);
+  }
+
   onMessageEnd(chatId: string): void {
     this.inner.onMessageEnd?.(chatId);
   }

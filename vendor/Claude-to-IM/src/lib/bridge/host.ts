@@ -146,6 +146,7 @@ export interface UpsertChannelBindingInput {
 export interface BridgeStore {
   // ── Settings ──
   getSetting(key: string): string | null;
+  setSetting?(key: string, value: string): void;
 
   // ── Channel bindings ──
   getChannelBinding(channelType: string, chatId: string): ChannelBinding | null;

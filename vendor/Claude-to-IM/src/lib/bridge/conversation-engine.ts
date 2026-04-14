@@ -56,11 +56,15 @@ export interface ConversationResult {
   responseText: string;
   tokenUsage: TokenUsage | null;
   hasError: boolean;
+  /** True when the task was aborted by user (not a real error) */
+  isAbort?: boolean;
   errorMessage: string;
   /** Permission request events that were forwarded during streaming */
   permissionRequests: PermissionRequestInfo[];
   /** SDK session ID captured from status/result events, for session resume */
   sdkSessionId: string | null;
+  /** Model name captured from status events */
+  model?: string;
 }
 
 /**
@@ -227,6 +231,7 @@ async function consumeStream(
   const seenToolResultIds = new Set<string>();
   const permissionRequests: PermissionRequestInfo[] = [];
   let capturedSdkSessionId: string | null = null;
+  let capturedModel: string | undefined;
 
   try {
     while (true) {
@@ -276,9 +281,9 @@ async function consumeStream(
               const toolData = event.data as Record<string, unknown>;
               contentBlocks.push({
                 type: 'tool_use',
-                id: toolData.id,
-                name: toolData.name,
-                input: toolData.input,
+                id: toolData.id as string,
+                name: toolData.name as string,
+                input: toolData.input as Record<string, unknown>,
               });
               if (onToolEvent) {
                 try { onToolEvent(toolData.id as string, toolData.name as string, 'running'); } catch { /* non-critical */ }
@@ -292,9 +297,9 @@ async function consumeStream(
               const resultData = event.data as Record<string, unknown>;
               const newBlock = {
                 type: 'tool_result' as const,
-                tool_use_id: resultData.tool_use_id,
-                content: resultData.content,
-                is_error: resultData.is_error || false,
+                tool_use_id: resultData.tool_use_id as string,
+                content: resultData.content as string,
+                is_error: (resultData.is_error as boolean) || false,
               };
               if (seenToolResultIds.has(resultData.tool_use_id as string)) {
                 const idx = contentBlocks.findIndex(
@@ -324,7 +329,7 @@ async function consumeStream(
               const perm: PermissionRequestInfo = {
                 permissionRequestId: permData.permissionRequestId as string,
                 toolName: permData.toolName as string,
-                toolInput: permData.toolInput,
+                toolInput: permData.toolInput as Record<string, unknown>,
                 suggestions: permData.suggestions as string[] | undefined,
               };
               permissionRequests.push(perm);
@@ -344,7 +349,7 @@ async function consumeStream(
               const questionData = event.data as Record<string, unknown>;
               const question: AskUserQuestionInfo = {
                 questionId: questionData.questionId as string,
-                toolInput: questionData.toolInput,
+                toolInput: questionData.toolInput as Record<string, unknown>,
               };
               if (onAskUserQuestion) {
                 onAskUserQuestion(question).catch((err) => {
@@ -359,11 +364,12 @@ async function consumeStream(
             try {
               const statusData = event.data as Record<string, unknown>;
               if (statusData.session_id) {
-                capturedSdkSessionId = statusData.session_id;
-                store.updateSdkSessionId(sessionId, statusData.session_id);
+                capturedSdkSessionId = statusData.session_id as string;
+                store.updateSdkSessionId(sessionId, statusData.session_id as string);
               }
               if (statusData.model) {
-                store.updateSessionModel(sessionId, statusData.model);
+                capturedModel = statusData.model as string;
+                store.updateSessionModel(sessionId, statusData.model as string);
               }
             } catch { /* skip */ }
             break;
@@ -373,7 +379,7 @@ async function consumeStream(
             try {
               const taskData = event.data as Record<string, unknown>;
               if (taskData.session_id && taskData.todos) {
-                store.syncSdkTasks(taskData.session_id, taskData.todos);
+                store.syncSdkTasks(taskData.session_id as string, taskData.todos as unknown[]);
               }
             } catch { /* skip */ }
             break;
@@ -387,11 +393,11 @@ async function consumeStream(
           case 'result': {
             try {
               const resultData = event.data as Record<string, unknown>;
-              if (resultData.usage) tokenUsage = resultData.usage;
+              if (resultData.usage) tokenUsage = resultData.usage as TokenUsage;
               if (resultData.is_error) hasError = true;
               if (resultData.session_id) {
-                capturedSdkSessionId = resultData.session_id;
-                store.updateSdkSessionId(sessionId, resultData.session_id);
+                capturedSdkSessionId = resultData.session_id as string;
+                store.updateSdkSessionId(sessionId, resultData.session_id as string);
               }
             } catch { /* skip */ }
             break;
@@ -439,6 +445,7 @@ async function consumeStream(
       errorMessage,
       permissionRequests,
       sdkSessionId: capturedSdkSessionId,
+      model: capturedModel,
     };
   } catch (e) {
     // Best-effort save on stream error
@@ -467,10 +474,12 @@ async function consumeStream(
     return {
       responseText: '',
       tokenUsage,
-      hasError: true,
+      hasError: !isAbort,
+      isAbort,
       errorMessage: isAbort ? 'Task stopped by user' : (e instanceof Error ? e.message : 'Stream consumption error'),
       permissionRequests,
       sdkSessionId: capturedSdkSessionId,
+      model: capturedModel,
     };
   }
 }

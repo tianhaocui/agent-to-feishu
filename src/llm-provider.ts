@@ -8,28 +8,47 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import type { SDKMessage, PermissionResult } from '@anthropic-ai/claude-agent-sdk';
 import type { LLMProvider, StreamChatParams, FileAttachment } from 'claude-to-im/src/lib/bridge/host.js';
+import { getBridgeContext } from 'claude-to-im/src/lib/bridge/context.js';
 import type { PendingPermissions } from './permission-gateway.js';
 
 import { sseEvent } from './sse-utils.js';
 
-/** Load MCP server configs from ~/.claude/settings.json (cached) */
+/** Load MCP server configs from ~/.claude/settings.json + ~/.claude.json (cached) */
 let _mcpCache: { value: Record<string, unknown> | undefined; ts: number } | null = null;
 function loadMcpServers(): Record<string, unknown> | undefined {
   if (_mcpCache && Date.now() - _mcpCache.ts < 60_000) return _mcpCache.value;
   try {
-    const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
-    const data = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
-    const servers = data.mcpServers;
-    const disabled = new Set(data.disabledMcpServers || []);
-    if (!servers || typeof servers !== 'object') { _mcpCache = { value: undefined, ts: Date.now() }; return undefined; }
     const active: Record<string, unknown> = {};
-    for (const [name, config] of Object.entries(servers)) {
-      if (!disabled.has(name)) active[name] = config;
-    }
+    const disabled = new Set<string>();
+
+    // Source 1: ~/.claude/settings.json
+    try {
+      const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+      const data = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+      if (data.disabledMcpServers) for (const d of data.disabledMcpServers) disabled.add(d);
+      if (data.mcpServers && typeof data.mcpServers === 'object') {
+        for (const [name, config] of Object.entries(data.mcpServers)) {
+          if (!disabled.has(name)) active[name] = config;
+        }
+      }
+    } catch { /* settings.json may not exist */ }
+
+    // Source 2: ~/.claude.json (global mcpServers — where cc-switch writes)
+    try {
+      const claudeJsonPath = path.join(os.homedir(), '.claude.json');
+      const data = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf-8'));
+      if (data.mcpServers && typeof data.mcpServers === 'object') {
+        for (const [name, config] of Object.entries(data.mcpServers)) {
+          if (!disabled.has(name) && !active[name]) active[name] = config;
+        }
+      }
+    } catch { /* .claude.json may not exist */ }
+
     const result = Object.keys(active).length > 0 ? active : undefined;
     _mcpCache = { value: result, ts: Date.now() };
     return result;
@@ -533,25 +552,39 @@ export class SDKLLMProvider implements LLMProvider {
               model = undefined;
             }
 
-            // Only pass model to CLI if explicitly configured via CTI_DEFAULT_MODEL.
+            // Pass model to CLI if:
+            //   1. CTI_DEFAULT_MODEL env var is set (global default), OR
+            //   2. The model was explicitly set at runtime (e.g. /model command)
             // Letting the CLI choose its own default avoids exit-code-1 failures
             // when a stored model is inaccessible on the current machine/plan.
-            const passModel = !!process.env.CTI_DEFAULT_MODEL;
+            const passModel = !!process.env.CTI_DEFAULT_MODEL || !!params.model;
             if (model && !passModel) {
               console.log(`[llm-provider] Skipping model "${model}", using CLI default (set CTI_DEFAULT_MODEL to override)`);
               model = undefined;
+            }
+
+            const freshSessionId = params.sdkSessionId ? undefined : crypto.randomUUID();
+            if (freshSessionId) {
+              console.log(`[llm-provider] New session — assigning sessionId=${freshSessionId} (no resume)`);
+            } else {
+              console.log(`[llm-provider] Resuming SDK session=${params.sdkSessionId}`);
             }
 
             const queryOptions: Record<string, unknown> = {
               cwd: params.workingDirectory,
               model,
               resume: params.sdkSessionId || undefined,
+              // When starting a fresh session (no sdkSessionId to resume), assign
+              // a random UUID so the CLI creates a brand-new session instead of
+              // auto-continuing the most recent one in the same cwd.
+              sessionId: freshSessionId,
               abortController: params.abortController,
               permissionMode: (params.permissionMode as 'default' | 'acceptEdits' | 'plan') || undefined,
               thinking: { type: 'adaptive' },
+              effort: getBridgeContext().store.getSetting('bridge_thinking_effort') || undefined,
               includePartialMessages: true,
               mcpServers: loadMcpServers(),
-              skills: loadSkillNames(),
+              settingSources: ['user', 'project', 'local'],
               sandbox: { enabled: false },
               systemPrompt: params.systemPrompt
                 ? { type: 'preset' as const, preset: 'claude_code' as const, append: params.systemPrompt }
@@ -570,8 +603,25 @@ export class SDKLLMProvider implements LLMProvider {
                 ): Promise<PermissionResult> => {
                   // Auto-approve if configured (useful for channels without
                   // interactive permission UI, e.g. Feishu WebSocket mode)
-                  if (autoApprove) {
+                  if (autoApprove && toolName !== 'AskUserQuestion') {
                     return { behavior: 'allow' as const, updatedInput: input };
+                  }
+
+                  // AskUserQuestion: emit as ask_user_question event (not permission_request)
+                  // so the bridge renders an interactive form card instead of permission buttons
+                  if (toolName === 'AskUserQuestion') {
+                    controller.enqueue(
+                      sseEvent('ask_user_question', {
+                        questionId: opts.toolUseID,
+                        toolInput: input,
+                      }),
+                    );
+
+                    const result = await pendingPerms.waitFor(opts.toolUseID);
+                    if (result.behavior === 'allow') {
+                      return { behavior: 'allow' as const, updatedInput: result.updatedInput || input };
+                    }
+                    return { behavior: 'deny' as const, message: result.message || 'Denied by user' };
                   }
 
                   // Emit permission_request SSE event for the bridge

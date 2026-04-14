@@ -3,3 +3,6 @@ dist/
 *.tgz
 .env
 config.env
+.omc/
+.plan/
+.codepilot-uploads/

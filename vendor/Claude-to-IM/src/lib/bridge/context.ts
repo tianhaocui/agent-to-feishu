@@ -20,6 +20,8 @@ export interface BridgeContext {
   llm: LLMProvider;
   permissions: PermissionGateway;
   lifecycle: LifecycleHooks;
+  /** LLM runtime type — controls session behavior (e.g. model switching). */
+  runtime?: 'claude' | 'codex' | 'auto';
 }
 
 const CONTEXT_KEY = '__bridge_context__';

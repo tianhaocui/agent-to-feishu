@@ -264,6 +264,8 @@ interface FinalCardFooter {
   elapsed: string;
   reasoningText?: string;
   reasoningElapsedMs?: number;
+  tokenUsage?: { input: number; output: number; cacheRead?: number; cacheCreation?: number } | null;
+  model?: string;
 }
 
 /**
@@ -345,6 +347,18 @@ export function buildFinalCardJson(
     if (footer.elapsed) {
       zhParts.push(`耗时 ${footer.elapsed}`);
       enParts.push(`Elapsed ${footer.elapsed}`);
+    }
+    if (footer.tokenUsage) {
+      const { input, output, cacheRead } = footer.tokenUsage;
+      const tokenStr = cacheRead
+        ? `${input}/${output} (cache ${cacheRead})`
+        : `${input}/${output}`;
+      zhParts.push(`tokens ${tokenStr}`);
+      enParts.push(`tokens ${tokenStr}`);
+    }
+    if (footer.model) {
+      zhParts.push(footer.model);
+      enParts.push(footer.model);
     }
 
     const isError = footer.status === 'error';
@@ -491,6 +505,81 @@ export function buildPermissionButtonCard(
           text_size: 'notation',
         },
       ],
+    },
+  });
+}
+
+// ── AskUserQuestion interactive form card ──────────────────
+
+export interface AskUserQuestionDef {
+  question: string;
+  options?: Array<{ label: string; description?: string }>;
+  multiSelect?: boolean;
+}
+
+/**
+ * Build a CardKit v2 interactive form card for AskUserQuestion.
+ */
+export function buildAskUserQuestionCard(
+  questionId: string,
+  questions: AskUserQuestionDef[],
+): string {
+  const formElements: unknown[] = [];
+
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i];
+    formElements.push({ tag: 'markdown', content: `**${q.question}**`, text_size: 'normal' });
+
+    if (q.options && q.options.length > 0) {
+      const optionItems = q.options.map((opt, idx) => ({
+        text: { tag: 'plain_text' as const, content: opt.description ? `${opt.label} — ${opt.description}` : opt.label },
+        value: `opt_${idx}_${opt.label}`,
+      }));
+      formElements.push(q.multiSelect
+        ? { tag: 'multi_select_static', name: `q_${i}`, placeholder: { tag: 'plain_text', content: '选择一个或多个...' }, options: optionItems }
+        : { tag: 'select_static', name: `q_${i}`, placeholder: { tag: 'plain_text', content: '选择...' }, options: optionItems }
+      );
+      // Always add a free-text input below options for custom answers
+      formElements.push({ tag: 'markdown', content: '或者手动输入：', text_size: 'notation' });
+      formElements.push({ tag: 'input', name: `q_${i}_custom`, placeholder: { tag: 'plain_text', content: '自定义回答（留空则使用上方选择）' } });
+    } else {
+      formElements.push({ tag: 'input', name: `q_${i}`, placeholder: { tag: 'plain_text', content: '输入回答...' } });
+    }
+  }
+
+  formElements.push({
+    tag: 'button', text: { tag: 'plain_text', content: '提交' },
+    type: 'primary', size: 'medium',
+    name: `ask_submit_${questionId}`, form_action_type: 'submit',
+  });
+
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: { title: { tag: 'plain_text', content: '请回答' }, template: 'blue', icon: { tag: 'standard_icon', token: 'chat-bubble-question_outlined' } },
+    body: { elements: [{ tag: 'form', name: 'ask_user_form', elements: formElements }] },
+  });
+}
+
+/** Build an "answered" card to replace the form after submission. */
+export function buildAskUserAnsweredCard(
+  questions: AskUserQuestionDef[],
+  answers: Record<string, string>,
+): string {
+  const lines = questions.map(q => `**${q.question}**\n✅ ${answers[q.question] || '(未回答)'}`);
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: { title: { tag: 'plain_text', content: '已回答' }, template: 'green', icon: { tag: 'standard_icon', token: 'check-circle_outlined' } },
+    body: {
+      elements: [{
+        tag: 'collapsible_panel',
+        expanded: false,
+        header: { title: { tag: 'plain_text', content: '查看回答' } },
+        border: { color: 'green' },
+        vertical_spacing: '8px',
+        elements: [{ tag: 'markdown', content: lines.join('\n\n'), text_size: 'normal' }],
+      }],
     },
   });
 }
