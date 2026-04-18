@@ -8,7 +8,7 @@
  */
 
 import { requestDeviceAuthorization, pollDeviceToken } from './device-flow.js';
-import { getStoredToken, setStoredToken, findAnyToken, tokenStatus, type StoredUAToken } from './token-store.js';
+import { setStoredToken, findAnyToken, tokenStatus, type StoredUAToken } from './token-store.js';
 import { refreshToken } from './token-refresh.js';
 import { buildAuthCard, buildAuthSuccessCard, buildAuthFailedCard } from './oauth-cards.js';
 import { updateMcpUserToken } from './mcp-config-writer.js';
