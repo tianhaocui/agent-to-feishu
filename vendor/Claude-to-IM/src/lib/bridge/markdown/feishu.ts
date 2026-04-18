@@ -551,7 +551,9 @@ export function buildResumeSessionCard(
         },
         {
           tag: 'column',
-          width: 'auto',
+          width: 'weighted',
+          weight: 1,
+          vertical_align: 'center',
           elements: [{
             tag: 'button',
             text: { tag: 'plain_text', content: 'Resume' },

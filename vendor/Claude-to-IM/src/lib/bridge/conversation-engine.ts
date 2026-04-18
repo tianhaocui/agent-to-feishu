@@ -275,6 +275,19 @@ async function consumeStream(
             }
             break;
 
+          case 'status': {
+            // Codex sends reasoning as status events with { reasoning: "..." }
+            const statusData = event.data as Record<string, unknown>;
+            if (statusData?.reasoning && typeof statusData.reasoning === 'string') {
+              thinkingText += statusData.reasoning;
+              if (onPartialText) {
+                const combined = `<think>\n${thinkingText}\n</think>\n\n${previewText}`;
+                try { onPartialText(combined); } catch { /* non-critical */ }
+              }
+            }
+            break;
+          }
+
           case 'tool_use': {
             if (currentText.trim()) {
               contentBlocks.push({ type: 'text', text: currentText });

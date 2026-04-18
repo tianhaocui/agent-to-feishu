@@ -1366,9 +1366,10 @@ async function handleCommand(
       const sessions = bindings.slice(0, 10).map(b => {
         let lastMessage = '';
         try {
-          const { messages } = store.getMessages(b.codepilotSessionId, { limit: 1 });
-          if (messages.length > 0) {
-            lastMessage = messages[messages.length - 1].content.replace(/\n/g, ' ').trim();
+          const { messages } = store.getMessages(b.codepilotSessionId, { limit: 10 });
+          const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+          if (lastUserMsg) {
+            lastMessage = lastUserMsg.content.replace(/\n/g, ' ').replace(/[`*\[\]\\'"/{}<>]/g, '').trim();
           }
         } catch { /* best effort */ }
         return {
@@ -1387,7 +1388,6 @@ async function handleCommand(
         address: msg.address,
         text: '',
         cardJson,
-        replyToMessageId: msg.messageId,
       });
       return;
     }
