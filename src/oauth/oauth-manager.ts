@@ -47,7 +47,7 @@ export class OAuthManager {
       const status = tokenStatus(token);
       if (status === 'valid') {
         console.log('[oauth-manager] Existing token is valid');
-        updateMcpUserToken(token.accessToken);
+        updateMcpUserToken(token.accessToken, appId, appSecret);
         return true;
       }
       if (status === 'needs_refresh') {
@@ -64,7 +64,7 @@ export class OAuthManager {
             scope: refreshed.scope || token.scope,
           };
           setStoredToken(ctiHome, updated);
-          updateMcpUserToken(updated.accessToken);
+          updateMcpUserToken(updated.accessToken, appId, appSecret);
           return true;
         }
       }
@@ -133,7 +133,7 @@ export class OAuthManager {
       setStoredToken(ctiHome, storedToken);
 
       // Step 6: Update MCP config
-      updateMcpUserToken(result.token.accessToken);
+      updateMcpUserToken(result.token.accessToken, appId, appSecret);
 
       // Step 7: Send success card
       await this.sendCard(chatId, buildAuthSuccessCard());
@@ -180,7 +180,7 @@ export class OAuthManager {
           refreshExpiresAt: now + refreshed.refreshExpiresIn * 1000,
         };
         setStoredToken(ctiHome, updated);
-        updateMcpUserToken(updated.accessToken);
+        updateMcpUserToken(updated.accessToken, appId, appSecret);
         console.log('[oauth-manager] Token refreshed via background timer');
       } else {
         console.warn('[oauth-manager] Background refresh failed, will need re-auth');

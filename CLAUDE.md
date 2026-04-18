@@ -31,3 +31,7 @@ CTI_HOME=~/.claude-to-im bash scripts/daemon.sh start
 ## Config
 
 All config in `~/.claude-to-im/config.env`. See `config.env.example` for all options.
+
+## 飞书文档操作
+
+使用 lark-mcp 创建飞书文档（`docx_builtin_import`、`bitable_v1_app_create` 等）时，必须传 `useUAT: true` 以用户身份创建，确保文档归属于用户而非 bot 应用。读取操作也建议使用 `useUAT: true`，可以访问用户有权限但 bot 无权限的文档。

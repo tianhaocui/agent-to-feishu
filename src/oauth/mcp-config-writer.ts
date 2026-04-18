@@ -26,7 +26,7 @@ function findLarkMcp(settings: any): { args: string[]; source: string } | null {
   return null;
 }
 
-export function updateMcpUserToken(token: string): void {
+export function updateMcpUserToken(token: string, appId?: string, appSecret?: string): void {
   try {
     const raw = readFileSync(CONFIG_PATH, 'utf8');
     const settings = JSON.parse(raw);
@@ -42,12 +42,29 @@ export function updateMcpUserToken(token: string): void {
     const oauthIdx = args.indexOf('--oauth');
     if (oauthIdx >= 0) args.splice(oauthIdx, 1);
 
+    // Sync --app-id and --app-secret if provided (multi-bot isolation)
+    if (appId) {
+      const aidIdx = args.indexOf('--app-id');
+      if (aidIdx >= 0) args.splice(aidIdx, 2);
+      args.push('--app-id', appId);
+    }
+    if (appSecret) {
+      const asIdx = args.indexOf('--app-secret');
+      if (asIdx >= 0) args.splice(asIdx, 2);
+      args.push('--app-secret', appSecret);
+    }
+
     // Remove existing --user-access-token + value
     const uatIdx = args.indexOf('--user-access-token');
     if (uatIdx >= 0) args.splice(uatIdx, 2);
 
     // Add --user-access-token
     args.push('--user-access-token', token);
+
+    // Force user identity for all MCP tool calls
+    const tmIdx = args.indexOf('--token-mode');
+    if (tmIdx >= 0) args.splice(tmIdx, 2);
+    args.push('--token-mode', 'user_access_token');
 
     writeFileSync(CONFIG_PATH, JSON.stringify(settings, null, 2) + '\n');
     console.log('[mcp-config] Updated lark-mcp with user_access_token');
@@ -68,6 +85,10 @@ export function clearMcpUserToken(): void {
     // Remove --user-access-token + value
     const uatIdx = args.indexOf('--user-access-token');
     if (uatIdx >= 0) args.splice(uatIdx, 2);
+
+    // Remove --token-mode + value
+    const tmIdx = args.indexOf('--token-mode');
+    if (tmIdx >= 0) args.splice(tmIdx, 2);
 
     // Add --oauth back if not present
     if (!args.includes('--oauth')) args.push('--oauth');

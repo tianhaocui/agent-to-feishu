@@ -137,7 +137,10 @@ export async function processMessage(
         savedContent = `[${files.length} image(s) attached] ${text}`;
       }
     }
-    store.addMessage(sessionId, 'user', savedContent);
+    // Skip saving slash commands to history — they're not real conversation turns
+    if (!text.startsWith('/')) {
+      store.addMessage(sessionId, 'user', savedContent);
+    }
 
     // Resolve provider
     let resolvedProvider: import('./host.js').BridgeApiProvider | undefined;

@@ -509,6 +509,69 @@ export function buildPermissionButtonCard(
   });
 }
 
+// ── Resume session picker card ───────────────────────────
+
+export interface ResumeSessionOption {
+  bindingId: string;
+  sessionIdShort: string;
+  cwd: string;
+  mode: string;
+  active: boolean;
+  runtime: string;
+  updatedAt: string;
+}
+
+/**
+ * Build a CardKit v2 card with buttons for picking a session to resume.
+ */
+export function buildResumeSessionCard(
+  chatId: string,
+  sessions: ResumeSessionOption[],
+): string {
+  const elements: unknown[] = [];
+
+  for (const s of sessions) {
+    const status = s.active ? '🟢' : '⚪';
+    const rt = s.runtime === 'codex' ? 'Codex' : 'Claude';
+    const line = `${status} \`${s.sessionIdShort}\` · **${s.cwd}** · ${s.mode} · ${rt}`;
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_align: 'left',
+      columns: [
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 4,
+          elements: [{ tag: 'markdown', content: line, text_size: 'normal' }],
+        },
+        {
+          tag: 'column',
+          width: 'auto',
+          elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: 'Resume' },
+            type: 'primary',
+            size: 'small',
+            value: { callback_data: `resume:${s.bindingId}`, chatId },
+          }],
+        },
+      ],
+    });
+  }
+
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: 'Resume Session' },
+      template: 'blue',
+      icon: { tag: 'standard_icon', token: 'history_outlined' },
+    },
+    body: { elements },
+  });
+}
+
 // ── AskUserQuestion interactive form card ──────────────────
 
 export interface AskUserQuestionDef {

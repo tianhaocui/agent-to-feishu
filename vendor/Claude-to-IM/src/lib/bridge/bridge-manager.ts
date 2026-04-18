@@ -515,14 +515,85 @@ async function handleMessage(
       return;
     }
 
+    // Resume session picker: resume:<bindingId>
+    if (msg.callbackData.startsWith('resume:')) {
+      const bindingId = msg.callbackData.slice('resume:'.length);
+      const { store } = getBridgeContext();
+      const bindings = router.listBindings(adapter.channelType);
+      const target = bindings.find(b => b.id === bindingId);
+      if (target) {
+        // Abort any running task on the current session
+        const oldBinding = router.resolve(msg.address);
+        const st = getState();
+        const oldTask = st.activeTasks.get(oldBinding.codepilotSessionId);
+        if (oldTask) {
+          oldTask.abort();
+          st.activeTasks.delete(oldBinding.codepilotSessionId);
+        }
+        // Bind this chat to the selected session
+        router.bindToSession(msg.address, target.codepilotSessionId);
+        await deliver(adapter, {
+          address: msg.address,
+          text: `Resumed session \`${target.codepilotSessionId.slice(0, 8)}...\` (${escapeHtml(target.workingDirectory || '~')})`,
+          parseMode: 'plain',
+        });
+        // Update the card to show selection result
+        if (msg.callbackMessageId && adapter.patchCardMessage) {
+          try {
+            const confirmedCard = JSON.stringify({
+              schema: '2.0',
+              config: { wide_screen_mode: true },
+              header: {
+                title: { tag: 'plain_text', content: 'Session Resumed' },
+                template: 'green',
+                icon: { tag: 'standard_icon', token: 'check-circle_outlined' },
+              },
+              body: { elements: [{ tag: 'markdown', content: `✅ \`${target.codepilotSessionId.slice(0, 8)}...\` · **${escapeHtml(target.workingDirectory || '~')}**`, text_size: 'normal' }] },
+            });
+            await adapter.patchCardMessage(msg.callbackMessageId, confirmedCard);
+          } catch { /* best effort */ }
+        }
+      } else {
+        await deliver(adapter, {
+          address: msg.address,
+          text: 'Session not found.',
+          parseMode: 'plain',
+        });
+      }
+      ack();
+      return;
+    }
+
     const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
     if (handled) {
-      const confirmMsg: OutboundMessage = {
-        address: msg.address,
-        text: 'Permission response recorded.',
-        parseMode: 'plain',
-      };
-      await deliver(adapter, confirmMsg);
+      // Collapse the permission card to a resolved state
+      const permMessageId = msg.callbackMessageId;
+      if (permMessageId && adapter.patchCardMessage) {
+        try {
+          const action = msg.callbackData.split(':')[1] || 'allow';
+          const actionLabel = action === 'deny' ? 'Denied' : action === 'allow_session' ? 'Allowed (session)' : 'Allowed';
+          const template = action === 'deny' ? 'red' : 'green';
+          const icon = action === 'deny' ? 'close-circle_outlined' : 'check-circle_outlined';
+          const collapsedCard = JSON.stringify({
+            schema: '2.0',
+            config: { wide_screen_mode: true },
+            header: {
+              title: { tag: 'plain_text', content: `Permission ${actionLabel}` },
+              template,
+              icon: { tag: 'standard_icon', token: icon },
+            },
+            body: { elements: [{
+              tag: 'collapsible_panel',
+              expanded: false,
+              header: { title: { tag: 'plain_text', content: `✅ ${actionLabel}` } },
+              border: { color: template },
+              vertical_spacing: '8px',
+              elements: [{ tag: 'markdown', content: `Permission response: **${actionLabel}**`, text_size: 'normal' }],
+            }] },
+          });
+          await adapter.patchCardMessage(permMessageId, collapsedCard);
+        } catch { /* best effort */ }
+      }
     }
     ack();
     return;
@@ -1120,6 +1191,7 @@ async function handleCommand(
         '/model &lt;name&gt; - Switch model (e.g. sonnet, opus)',
         '/status - Show current status',
         '/sessions - List recent sessions',
+        '/resume [n] - Resume a previous session',
         '/stop - Stop current session',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
         '/help - Show this help',
@@ -1201,16 +1273,17 @@ async function handleCommand(
       const binding = router.resolve(msg.address);
       if (!args) {
         const rt = getBridgeContext().runtime;
-        const lines = [`Current model: <code>${binding.model || 'default'}</code>`];
-        if (rt === 'codex') {
-          lines.push(`Available: <code>o3</code> | <code>o4-mini</code> | <code>gpt-4.1</code> | <code>codex-mini</code>`);
-        } else {
-          lines.push(
-            `Available:`,
-            `  <code>sonnet</code>  <code>opus</code>  <code>haiku</code>`,
-            `  <code>sonnet[1m]</code>  <code>opus[1m]</code>  (1M context)`,
-          );
+        // Resolve actual model: binding override > runtime default config
+        let actualModel = binding.model || '';
+        if (!actualModel && rt === 'codex') {
+          try {
+            const tomlPath = require('path').join(require('os').homedir(), '.codex', 'config.toml');
+            const toml = require('fs').readFileSync(tomlPath, 'utf-8');
+            const match = toml.match(/^\s*model\s*=\s*"([^"]+)"/m);
+            if (match) actualModel = match[1];
+          } catch { /* ignore */ }
         }
+        const lines = [`Current model: <code>${actualModel || 'default'}</code>`];
         lines.push(`Usage: /model &lt;name&gt; · /model default to reset.`);
         response = lines.join('\n');
         break;
@@ -1218,8 +1291,8 @@ async function handleCommand(
       const modelName = args.toLowerCase() === 'default' ? '' : args.trim();
       // Claude Code supports resuming a session with a different model,
       // so we keep sdkSessionId intact. Codex does not — clear it to force a new thread.
-      const rt = getBridgeContext().runtime;
-      const needsNewSession = rt === 'codex';
+      const rt2 = getBridgeContext().runtime;
+      const needsNewSession = rt2 === 'codex';
       const updates: Partial<ChannelBinding> = { model: modelName };
       if (needsNewSession) {
         updates.sdkSessionId = '';
@@ -1258,6 +1331,54 @@ async function handleCommand(
         response = lines.join('\n');
       }
       break;
+    }
+
+    case '/resume': {
+      const bindings = router.listBindings(adapter.channelType)
+        .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+      if (bindings.length === 0) {
+        response = 'No sessions to resume.';
+        break;
+      }
+      // Direct resume by index: /resume 1
+      if (args && /^\d+$/.test(args)) {
+        const idx = parseInt(args, 10) - 1;
+        if (idx < 0 || idx >= bindings.length) {
+          response = `Invalid index. Use 1-${bindings.length}.`;
+          break;
+        }
+        const target = bindings[idx];
+        const oldBinding = router.resolve(msg.address);
+        const st = getState();
+        const oldTask = st.activeTasks.get(oldBinding.codepilotSessionId);
+        if (oldTask) {
+          oldTask.abort();
+          st.activeTasks.delete(oldBinding.codepilotSessionId);
+        }
+        router.bindToSession(msg.address, target.codepilotSessionId);
+        response = `Resumed session <code>${target.codepilotSessionId.slice(0, 8)}...</code> (${escapeHtml(target.workingDirectory || '~')})`;
+        break;
+      }
+      // Interactive card picker
+      const rt = getBridgeContext().runtime || 'claude';
+      const { buildResumeSessionCard } = await import('./markdown/feishu.js');
+      const sessions = bindings.slice(0, 10).map(b => ({
+        bindingId: b.id,
+        sessionIdShort: b.codepilotSessionId.slice(0, 8) + '...',
+        cwd: b.workingDirectory || '~',
+        mode: b.mode,
+        active: b.active !== false,
+        runtime: rt,
+        updatedAt: b.updatedAt || '',
+      }));
+      const cardJson = buildResumeSessionCard(msg.address.chatId, sessions);
+      await deliver(adapter, {
+        address: msg.address,
+        text: '',
+        cardJson,
+        replyToMessageId: msg.messageId,
+      });
+      return;
     }
 
     case '/stop': {
@@ -1332,6 +1453,7 @@ async function handleCommand(
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
         '/sessions - List recent sessions',
+        '/resume [n] - Resume a previous session',
         '/stop - Stop current session',
         '/think low|medium|high|max|off - Set thinking effort',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
@@ -1469,6 +1591,17 @@ export function startRelayServer(): void {
       let injected = false;
       for (const [, adapter] of state.adapters) {
         if (adapter.injectMessage) {
+          // Relay messages from other bots are context-only by default
+          // unless this bot is explicitly @mentioned in the text.
+          const botOpenId = (adapter as any).botOpenId as string | undefined;
+          const botName = botOpenId
+            ? ((adapter as any).knownBotsByOpenId as Map<string, string>)?.get(botOpenId) || ''
+            : '';
+          const isMentioned = (botName && text.includes(`@${botName}`))
+            || (botName && text.includes(`@[${botName}]`))
+            || (botOpenId && text.includes(botOpenId));
+          const isContextOnly = (senderType === 'bot') && !isMentioned;
+
           const msg: InboundMessage = {
             messageId: replyMessageId || `relay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             address: { channelType: adapter.channelType, chatId },
@@ -1477,10 +1610,11 @@ export function startRelayServer(): void {
             senderType: senderType || 'bot',
             senderName: senderName || 'unknown-bot',
             isGroup: true,
+            contextOnly: isContextOnly || undefined,
           };
           adapter.injectMessage(msg);
           injected = true;
-          console.log(`[relay-server] Injected message from ${senderName} to chat ${chatId}`);
+          console.log(`[relay-server] Injected message from ${senderName} to chat ${chatId} (contextOnly=${isContextOnly})`);
           break;
         }
       }

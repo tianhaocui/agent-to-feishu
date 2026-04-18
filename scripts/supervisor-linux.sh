@@ -19,13 +19,15 @@ supervisor_stop() {
   pid=$(read_pid)
   if [ -z "$pid" ]; then echo "No bridge running"; return 0; fi
   if pid_alive "$pid"; then
-    kill "$pid"
+    # Kill the entire process group (bridge + spawned CLI subprocesses).
+    # The bridge is started with setsid, so its PID == PGID.
+    kill -- -"$pid" 2>/dev/null || kill "$pid"
     for _ in $(seq 1 10); do
       pid_alive "$pid" || break
       sleep 1
     done
+    pid_alive "$pid" && kill -9 -- -"$pid" 2>/dev/null
     pid_alive "$pid" && kill -9 "$pid"
-    echo "Bridge stopped"
   else
     echo "Bridge was not running (stale PID file)"
   fi

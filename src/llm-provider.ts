@@ -91,6 +91,7 @@ const ENV_WHITELIST = new Set([
   'NODE_PATH', 'NODE_EXTRA_CA_CERTS',
   'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME',
   'SSH_AUTH_SOCK',
+  'LARK_PROFILE',
 ]);
 
 /** Prefixes that are always stripped (even in inherit mode). */
@@ -603,7 +604,10 @@ export class SDKLLMProvider implements LLMProvider {
                 ): Promise<PermissionResult> => {
                   // Auto-approve if configured (useful for channels without
                   // interactive permission UI, e.g. Feishu WebSocket mode)
-                  if (autoApprove && toolName !== 'AskUserQuestion') {
+                  // Plan-mode gate tools must always require user confirmation
+                  // so the AI cannot silently enter/exit plan mode on its own.
+                  const ALWAYS_CONFIRM_TOOLS = new Set(['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode']);
+                  if (autoApprove && !ALWAYS_CONFIRM_TOOLS.has(toolName)) {
                     return { behavior: 'allow' as const, updatedInput: input };
                   }
 
@@ -640,6 +644,11 @@ export class SDKLLMProvider implements LLMProvider {
                   if (result.behavior === 'allow') {
                     return { behavior: 'allow' as const, updatedInput: input };
                   }
+                  // Abort the session on deny to prevent the AI from retrying
+                  // with alternative approaches after permission is refused.
+                  if (params.abortController) {
+                    params.abortController.abort();
+                  }
                   return {
                     behavior: 'deny' as const,
                     message: result.message || 'Denied by user',
@@ -675,6 +684,9 @@ export class SDKLLMProvider implements LLMProvider {
             // A trailing "process exited with code 1" is transport teardown noise.
             if (state.hasReceivedResult && isTransportExit) {
               console.log('[llm-provider] Suppressing transport error — result already received');
+              if (stderrBuf) {
+                console.warn('[llm-provider] stderr (suppressed):', stderrBuf.trim().slice(-500));
+              }
               controller.close();
               return;
             }
@@ -769,6 +781,7 @@ export function handleMessage(
         event.type === 'content_block_start' &&
         event.content_block.type === 'tool_use'
       ) {
+        console.log(`[llm-provider] tool_use: ${event.content_block.name} (id=${event.content_block.id})`);
         controller.enqueue(
           sseEvent('tool_use', {
             id: event.content_block.id,
@@ -866,6 +879,12 @@ export function handleMessage(
             model: msg.model,
           }),
         );
+      }
+      if (msg.subtype === 'local_command_output') {
+        const content = (msg as { content?: string }).content || '';
+        if (content) {
+          controller.enqueue(sseEvent('text', content));
+        }
       }
       break;
     }

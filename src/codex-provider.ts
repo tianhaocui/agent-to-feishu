@@ -37,16 +37,22 @@ type ThreadInstance = any;
 
 /**
  * Map bridge permission modes to Codex approval policies.
- * - 'acceptEdits' (code mode) → 'on-failure' (auto-approve most things)
- * - 'plan' → 'on-request' (ask before executing)
- * - 'default' (ask mode) → 'on-request'
+ *
+ * The Codex SDK does NOT expose approval request events — `approvalPolicy`
+ * is passed to the CLI process which handles approval via stdin.  Since the
+ * bridge runs non-interactively (no stdin), `on-request` would block
+ * indefinitely.  We therefore use `on-failure` for all modes, which
+ * auto-approves most actions and only retries on failure.
+ *
+ * This differs from the Claude SDK path where `canUseTool` callbacks allow
+ * interactive approval forwarded to Feishu.
  */
 function toApprovalPolicy(permissionMode?: string): string {
   switch (permissionMode) {
     case 'acceptEdits': return 'on-failure';
-    case 'plan': return 'on-request';
-    case 'default': return 'on-request';
-    default: return 'on-request';
+    case 'plan': return 'on-failure';
+    case 'default': return 'on-failure';
+    default: return 'on-failure';
   }
 }
 
@@ -95,10 +101,10 @@ export class CodexProvider implements LLMProvider {
       );
     }
 
-    // Resolve API key: CTI_CODEX_API_KEY > CODEX_API_KEY > OPENAI_API_KEY > (login auth)
+    // Resolve API key: CTI_CODEX_API_KEY > CODEX_API_KEY > (skip OPENAI_API_KEY to avoid
+    // overriding config.toml model_provider settings) > (login auth)
     const apiKey = process.env.CTI_CODEX_API_KEY
       || process.env.CODEX_API_KEY
-      || process.env.OPENAI_API_KEY
       || undefined;
     const baseUrl = process.env.CTI_CODEX_BASE_URL || undefined;
 
