@@ -519,6 +519,7 @@ export interface ResumeSessionOption {
   active: boolean;
   runtime: string;
   updatedAt: string;
+  lastMessage?: string;
 }
 
 /**
@@ -534,6 +535,9 @@ export function buildResumeSessionCard(
     const status = s.active ? '🟢' : '⚪';
     const rt = s.runtime === 'codex' ? 'Codex' : 'Claude';
     const line = `${status} \`${s.sessionIdShort}\` · **${s.cwd}** · ${s.mode} · ${rt}`;
+    const preview = s.lastMessage
+      ? `\n> ${s.lastMessage.slice(0, 60)}${s.lastMessage.length > 60 ? '…' : ''}`
+      : '';
     elements.push({
       tag: 'column_set',
       flex_mode: 'none',
@@ -543,7 +547,7 @@ export function buildResumeSessionCard(
           tag: 'column',
           width: 'weighted',
           weight: 4,
-          elements: [{ tag: 'markdown', content: line, text_size: 'normal' }],
+          elements: [{ tag: 'markdown', content: line + preview, text_size: 'normal' }],
         },
         {
           tag: 'column',

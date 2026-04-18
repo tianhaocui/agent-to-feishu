@@ -1361,16 +1361,27 @@ async function handleCommand(
       }
       // Interactive card picker
       const rt = getBridgeContext().runtime || 'claude';
+      const { store } = getBridgeContext();
       const { buildResumeSessionCard } = await import('./markdown/feishu.js');
-      const sessions = bindings.slice(0, 10).map(b => ({
-        bindingId: b.id,
-        sessionIdShort: b.codepilotSessionId.slice(0, 8) + '...',
-        cwd: b.workingDirectory || '~',
-        mode: b.mode,
-        active: b.active !== false,
-        runtime: rt,
-        updatedAt: b.updatedAt || '',
-      }));
+      const sessions = bindings.slice(0, 10).map(b => {
+        let lastMessage = '';
+        try {
+          const { messages } = store.getMessages(b.codepilotSessionId, { limit: 1 });
+          if (messages.length > 0) {
+            lastMessage = messages[messages.length - 1].content.replace(/\n/g, ' ').trim();
+          }
+        } catch { /* best effort */ }
+        return {
+          bindingId: b.id,
+          sessionIdShort: b.codepilotSessionId.slice(0, 8) + '...',
+          cwd: b.workingDirectory || '~',
+          mode: b.mode,
+          active: b.active !== false,
+          runtime: rt,
+          updatedAt: b.updatedAt || '',
+          lastMessage,
+        };
+      });
       const cardJson = buildResumeSessionCard(msg.address.chatId, sessions);
       await deliver(adapter, {
         address: msg.address,
