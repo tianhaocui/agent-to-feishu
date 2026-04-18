@@ -29,6 +29,10 @@ Claude Code / Codex → 读写你的代码库
 - **多机器人协作** — 群聊中多个 AI 机器人可互相 @mention 对话，支持深度限制和冷却时间
 - **MCP 服务器 & Skills** — 自动加载 `~/.claude/settings.json` 中的 MCP 服务器和 `~/.claude/skills/` 中的技能
 - **斜杠命令** — `/ask`、`/run`、`/code` 转发给 AI；未知命令默认也转发
+- **会话恢复** — `/resume` 命令通过交互卡片选择器切换到历史会话
+- **权限卡片折叠** — 操作后权限卡片自动收起为简洁状态
+- **上下文感知多机器人** — 其他机器人的消息默认为上下文，仅被 @mention 时才触发回复
+- **Lark CLI 身份隔离** — `LARK_PROFILE` 环境变量支持多机器人凭据隔离
 - **双运行时** — Claude Code CLI 或 Codex SDK，通过配置切换
 - **第三方 API** — 支持通过 `ANTHROPIC_BASE_URL` 使用第三方 API 提供商
 - **会话持久化** — 对话在守护进程重启后保留，自动恢复会话
@@ -101,6 +105,7 @@ CTI_HOME=~/.claude-to-im bash scripts/daemon.sh start
 | `/code <任务>` | 让 AI 写代码 |
 | `/new [路径]` | 新建会话 |
 | `/stop` | 停止当前任务 |
+| `/resume [n]` | 恢复历史会话（交互选择器或按序号） |
 | `/status` | 查看会话状态 |
 | `/mode plan\|code\|ask` | 切换模式 |
 | `/cwd /路径` | 切换工作目录 |
@@ -125,6 +130,16 @@ CTI_FEISHU_KNOWN_BOTS=BotA:ou_xxx,BotB:ou_yyy
 CTI_FEISHU_BOT_MAX_DEPTH=3          # 最大对话深度（默认 3）
 CTI_FEISHU_BOT_COOLDOWN_MS=5000     # 冷却时间毫秒（默认 5000）
 ```
+
+## Lark CLI 身份隔离
+
+同一台机器运行多个机器人时，使用 `LARK_PROFILE` 隔离 lark CLI 凭据：
+
+```env
+LARK_PROFILE=my-bot
+```
+
+初始化：`LARK_PROFILE=my-bot lark config set --app-id <id> --app-secret <secret>`
 
 ## 配对审批
 

@@ -6,3 +6,4 @@ config.env
 .omc/
 .plan/
 .codepilot-uploads/
+.omx/

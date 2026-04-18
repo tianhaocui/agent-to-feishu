@@ -26,6 +26,15 @@ export class FeishuPairingAdapter extends BaseChannelAdapter {
   get botName(): string | null | undefined {
     return this.inner.botName;
   }
+  get botOpenId(): string | undefined {
+    return (this.inner as any).botOpenId;
+  }
+  get knownBotsByOpenId(): Map<string, string> | undefined {
+    return (this.inner as any).knownBotsByOpenId;
+  }
+  registerPeerBot(name: string, openId: string): void {
+    (this.inner as any).registerPeerBot?.(name, openId);
+  }
   private readonly inner = new UpstreamFeishuAdapter();
   private readonly pairingStore = getFeishuPairingStore();
 

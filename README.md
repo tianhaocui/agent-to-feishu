@@ -29,6 +29,10 @@ The daemon connects to Feishu via WebSocket (no public IP needed), receives mess
 - **Multi-bot collaboration** — multiple AI bots in a group chat can @mention each other, with depth limits and cooldown
 - **MCP servers & Skills** — auto-loads MCP servers from `~/.claude/settings.json` and skills from `~/.claude/skills/`
 - **Slash commands** — `/ask`, `/run`, `/code` forward to AI; unknown commands also forwarded by default
+- **Session resume** — `/resume` command with interactive card picker to switch between previous sessions
+- **Permission card collapse** — permission cards fold into a compact resolved state after action
+- **Context-aware multi-bot** — relay messages from other bots are context-only unless explicitly @mentioned
+- **Lark CLI profile isolation** — `LARK_PROFILE` env var for multi-bot identity separation
 - **Dual runtime** — Claude Code CLI or Codex SDK, switchable via config
 - **Third-party API** — supports third-party API providers via `ANTHROPIC_BASE_URL`
 - **Session persistence** — conversations survive daemon restarts with automatic session resume
@@ -101,6 +105,7 @@ Commands available inside Feishu chat:
 | `/code <task>` | Ask AI to write code |
 | `/new [path]` | Start new session |
 | `/stop` | Stop current task |
+| `/resume [n]` | Resume a previous session (interactive picker or by index) |
 | `/status` | Show session status |
 | `/mode plan\|code\|ask` | Change mode |
 | `/cwd /path` | Change working directory |
@@ -125,6 +130,16 @@ CTI_FEISHU_KNOWN_BOTS=BotA:ou_xxx,BotB:ou_yyy
 CTI_FEISHU_BOT_MAX_DEPTH=3          # max conversation depth (default: 3)
 CTI_FEISHU_BOT_COOLDOWN_MS=5000     # cooldown in ms (default: 5000)
 ```
+
+## Lark CLI Profile Isolation
+
+When running multiple bots on the same machine, use `LARK_PROFILE` to isolate lark CLI credentials per bot:
+
+```env
+LARK_PROFILE=my-bot
+```
+
+Initialize with: `LARK_PROFILE=my-bot lark config set --app-id <id> --app-secret <secret>`
 
 ## Pairing Approval
 
