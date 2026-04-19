@@ -276,8 +276,8 @@ async function consumeStream(
             break;
 
           case 'status': {
-            // Codex sends reasoning as status events with { reasoning: "..." }
             const statusData = event.data as Record<string, unknown>;
+            // Codex sends reasoning as status events with { reasoning: "..." }
             if (statusData?.reasoning && typeof statusData.reasoning === 'string') {
               thinkingText += statusData.reasoning;
               if (onPartialText) {
@@ -285,6 +285,17 @@ async function consumeStream(
                 try { onPartialText(combined); } catch { /* non-critical */ }
               }
             }
+            // Capture session_id and model from status events
+            try {
+              if (statusData.session_id) {
+                capturedSdkSessionId = statusData.session_id as string;
+                store.updateSdkSessionId(sessionId, statusData.session_id as string);
+              }
+              if (statusData.model) {
+                capturedModel = statusData.model as string;
+                store.updateSessionModel(sessionId, statusData.model as string);
+              }
+            } catch { /* skip */ }
             break;
           }
 
@@ -371,21 +382,6 @@ async function consumeStream(
                 onAskUserQuestion(question).catch((err) => {
                   console.error('[conversation-engine] Failed to forward ask_user_question:', err);
                 });
-              }
-            } catch { /* skip */ }
-            break;
-          }
-
-          case 'status': {
-            try {
-              const statusData = event.data as Record<string, unknown>;
-              if (statusData.session_id) {
-                capturedSdkSessionId = statusData.session_id as string;
-                store.updateSdkSessionId(sessionId, statusData.session_id as string);
-              }
-              if (statusData.model) {
-                capturedModel = statusData.model as string;
-                store.updateSessionModel(sessionId, statusData.model as string);
               }
             } catch { /* skip */ }
             break;
