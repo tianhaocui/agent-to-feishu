@@ -6,7 +6,7 @@ Bridge AI coding agents (Claude Code / Codex) to Feishu — chat with your AI ag
 
 ## How It Works
 
-```
+```text
 Feishu Bot (WebSocket long connection)
   ↕
 Bridge Daemon (Node.js)
@@ -161,7 +161,7 @@ CTI_FEISHU_PAIRING_AUTO_APPROVE_USERS=ou_owner1
 
 ## Permission Flow
 
-```
+```text
 1. AI wants to use a tool (e.g., Edit file)
 2. Bridge sends a permission card with Allow / Allow Session / Deny buttons
 3. User taps a button or replies 1/2/3
@@ -171,7 +171,7 @@ CTI_FEISHU_PAIRING_AUTO_APPROVE_USERS=ou_owner1
 
 ## Architecture
 
-```
+```text
 ~/.claude-to-im/
 ├── config.env             ← Credentials & settings (chmod 600)
 ├── data/
@@ -188,12 +188,12 @@ CTI_FEISHU_PAIRING_AUTO_APPROVE_USERS=ou_owner1
 
 | Component | Role |
 |---|---|
-| `src/main.ts` | Daemon entry, DI assembly |
-| `src/llm-provider.ts` | Claude Agent SDK → SSE stream (with thinking support) |
-| `src/codex-provider.ts` | Codex SDK → SSE stream |
-| `src/adapters/feishu-adapter.ts` | Pairing gate + approval cards |
-| `src/permission-gateway.ts` | Async bridge: SDK canUseTool ↔ IM buttons |
-| `vendor/Claude-to-IM/` | Core bridge library (adapters, streaming, delivery) |
+| [src/main.ts](src/main.ts) | Daemon entry, DI assembly |
+| [src/llm-provider.ts](src/llm-provider.ts) | Claude Agent SDK → SSE stream (with thinking support) |
+| [src/codex-provider.ts](src/codex-provider.ts) | Codex SDK → SSE stream |
+| [src/adapters/feishu-adapter.ts](src/adapters/feishu-adapter.ts) | Pairing gate + approval cards |
+| [src/permission-gateway.ts](src/permission-gateway.ts) | Async bridge: SDK canUseTool ↔ IM buttons |
+| [vendor/Claude-to-IM/](vendor/Claude-to-IM/) | Core bridge library (adapters, streaming, delivery) |
 
 ## Daemon Management
 
