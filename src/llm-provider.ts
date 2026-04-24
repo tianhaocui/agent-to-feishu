@@ -744,6 +744,27 @@ export class SDKLLMProvider implements LLMProvider {
       },
     });
   }
+
+  async listModels(): Promise<string[]> {
+    const apiKey = process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
+    const baseUrl = (process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, '');
+    if (!apiKey) return [];
+    try {
+      const resp = await fetch(`${baseUrl}/v1/models?limit=100`, {
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!resp.ok) return [];
+      const data = (await resp.json()) as { data?: Array<{ id: string }> };
+      return (data.data || [])
+        .map(m => m.id)
+        .filter(id => !id.endsWith('-thinking'))
+        .sort();
+    } catch { return []; }
+  }
 }
 
 /** @internal Exported for testing. */

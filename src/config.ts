@@ -42,6 +42,10 @@ export interface Config {
   feishuOAuthEnabled?: boolean;
   feishuOAuthAdminChatId?: string;
   feishuOAuthScope?: string;
+  // Orchestration
+  orchRole?: 'coordinator' | 'worker' | 'none';
+  orchSkills?: string[];
+  orchMaxConcurrent?: number;
 }
 
 export const CTI_HOME = process.env.CTI_HOME || path.join(os.homedir(), ".claude-to-im");
@@ -148,6 +152,9 @@ export function loadConfig(): Config {
     feishuOAuthEnabled: env.get("CTI_FEISHU_OAUTH_ENABLED") === "true",
     feishuOAuthAdminChatId: env.get("CTI_FEISHU_OAUTH_ADMIN_CHAT_ID") || undefined,
     feishuOAuthScope: env.get("CTI_FEISHU_OAUTH_SCOPE") || undefined,
+    orchRole: (env.get("CTI_ORCH_ROLE") as Config['orchRole']) || 'none',
+    orchSkills: env.get("CTI_ORCH_SKILLS")?.split(",").map(s => s.trim()).filter(Boolean) || [],
+    orchMaxConcurrent: env.get("CTI_ORCH_MAX_CONCURRENT") ? parseInt(env.get("CTI_ORCH_MAX_CONCURRENT")!, 10) : 3,
   };
 }
 

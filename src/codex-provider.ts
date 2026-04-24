@@ -124,6 +124,7 @@ export class CodexProvider implements LLMProvider {
       start(controller) {
         (async () => {
           const tempFiles: string[] = [];
+          const collectedErrors: string[] = [];
           try {
             const { codex } = await self.ensureSDK();
 
@@ -223,12 +224,14 @@ export class CodexProvider implements LLMProvider {
 
                     case 'turn.failed': {
                       const error = (event as { message?: string }).message;
+                      if (error) collectedErrors.push(error);
                       controller.enqueue(sseEvent('error', error || 'Turn failed'));
                       break;
                     }
 
                     case 'error': {
                       const error = (event as { message?: string }).message;
+                      if (error) collectedErrors.push(error);
                       controller.enqueue(sseEvent('error', error || 'Thread error'));
                       break;
                     }
@@ -251,8 +254,16 @@ export class CodexProvider implements LLMProvider {
 
             controller.close();
           } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
+            const rawMessage = err instanceof Error ? err.message : String(err);
+            // SDK error often just says "Codex Exec exited with code 1: Reading prompt from stdin..."
+            // which is useless. Prefer collected error events from the stream if available.
+            const message = collectedErrors.length > 0
+              ? collectedErrors[collectedErrors.length - 1]
+              : rawMessage;
             console.error('[codex-provider] Error:', err instanceof Error ? err.stack || err.message : err);
+            if (collectedErrors.length > 0) {
+              console.error('[codex-provider] Collected stream errors:', collectedErrors);
+            }
             try {
               controller.enqueue(sseEvent('error', message));
               controller.close();
@@ -363,5 +374,22 @@ export class CodexProvider implements LLMProvider {
         break;
       }
     }
+  }
+
+  async listModels(): Promise<string[]> {
+    const apiKey = process.env.CTI_CODEX_API_KEY
+      || process.env.CODEX_API_KEY
+      || process.env.OPENAI_API_KEY;
+    const baseUrl = (process.env.CTI_CODEX_BASE_URL || 'https://api.openai.com').replace(/\/+$/, '');
+    if (!apiKey) return [];
+    try {
+      const resp = await fetch(`${baseUrl}/v1/models`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!resp.ok) return [];
+      const data = (await resp.json()) as { data?: Array<{ id: string }> };
+      return (data.data || []).map(m => m.id).sort();
+    } catch { return []; }
   }
 }

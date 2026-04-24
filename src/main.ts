@@ -162,6 +162,40 @@ async function main(): Promise<void> {
 
   await bridgeManager.start();
 
+  // Orchestration — multi-agent coordinator/worker mode
+  if (config.orchRole && config.orchRole !== 'none') {
+    const { initOrchestration, handleOrchMessage, maybeIntercept, getOrchRole } = await import('./orchestration/index.js');
+    const { registerOrchestrationHandler, registerOrchestrationInterceptor, registerOrchestrationCompletionCallback } = await import('claude-to-im/src/lib/bridge/bridge-manager.js');
+    const relayPeersMap = new Map<string, { host: string; port: number }>();
+    if (config.relayPeers) {
+      for (const p of config.relayPeers) {
+        relayPeersMap.set(p.name.toLowerCase(), { host: p.host, port: p.port });
+      }
+    }
+    // Resolve bot name lazily — adapter sets botName after WS handshake
+    const state = bridgeManager.getState();
+    const feishuAdapter = state.adapters.get('feishu') as any;
+    const getBotName = () => feishuAdapter?.botName || 'unknown';
+    initOrchestration({
+      orchRole: config.orchRole,
+      orchSkills: config.orchSkills || [],
+      orchMaxConcurrent: config.orchMaxConcurrent || 3,
+      runtime: config.runtime,
+      botName: getBotName,
+      relayPeers: relayPeersMap,
+    });
+
+    // Register hooks into the vendor bridge-manager
+    registerOrchestrationHandler(handleOrchMessage as any);
+    if (getOrchRole() === 'coordinator') {
+      registerOrchestrationInterceptor(maybeIntercept as any);
+    }
+    if (getOrchRole() === 'worker') {
+      const { onStreamCompletion } = await import('./orchestration/worker.js');
+      registerOrchestrationCompletionCallback(onStreamCompletion);
+    }
+  }
+
   // OAuth Device Flow — obtain user_access_token for lark-mcp
   let oauthManager: import('./oauth/oauth-manager.js').OAuthManager | null = null;
   if (config.feishuOAuthEnabled && config.feishuAppId && config.feishuAppSecret) {

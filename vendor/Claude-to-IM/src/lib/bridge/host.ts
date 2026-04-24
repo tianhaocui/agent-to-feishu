@@ -227,6 +227,9 @@ export interface LLMProvider {
    * Returns a ReadableStream of SSE-formatted strings.
    */
   streamChat(params: StreamChatParams): ReadableStream<string>;
+
+  /** Return available model IDs from the upstream API. */
+  listModels?(): Promise<string[]>;
 }
 
 // ── Host Interface: Permission Gateway ───────────────────────
