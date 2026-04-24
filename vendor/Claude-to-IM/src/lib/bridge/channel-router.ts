@@ -79,6 +79,7 @@ export function bindToSession(
     channelType: address.channelType,
     chatId: address.chatId,
     codepilotSessionId,
+    sdkSessionId: session.sdk_session_id || '',
     workingDirectory: session.working_directory,
     model: session.model,
   });

@@ -462,16 +462,17 @@ async function handleMessage(
       const answers: Record<string, string> = {};
       for (let i = 0; i < questions.length; i++) {
         const q = questions[i];
-        const rawValue = msg.formValue[`q_${i}`];
-        if (rawValue === undefined || rawValue === null) continue;
 
-        // Check if user typed a custom answer (takes priority over dropdown)
+        // Check custom text input first (independent of dropdown selection)
         const customKey = `q_${i}_custom`;
         const customValue = msg.formValue[customKey];
         if (typeof customValue === 'string' && customValue.trim()) {
           answers[q.question] = customValue.trim();
           continue;
         }
+
+        const rawValue = msg.formValue[`q_${i}`];
+        if (rawValue === undefined || rawValue === null) continue;
 
         if (q.multiSelect && Array.isArray(rawValue)) {
           // Multi-select: values are "opt_N_label", extract labels
@@ -531,7 +532,16 @@ async function handleMessage(
           st.activeTasks.delete(oldBinding.codepilotSessionId);
         }
         // Bind this chat to the selected session
-        router.bindToSession(msg.address, target.codepilotSessionId);
+        const newBinding = router.bindToSession(msg.address, target.codepilotSessionId);
+        if (!newBinding) {
+          await deliver(adapter, {
+            address: msg.address,
+            text: 'Session data not found (may have been cleaned up). Use `/new` to start a fresh session.',
+            parseMode: 'plain',
+          });
+          ack();
+          return;
+        }
         await deliver(adapter, {
           address: msg.address,
           text: `Resumed session \`${target.codepilotSessionId.slice(0, 8)}...\` (${escapeHtml(target.workingDirectory || '~')})`,
@@ -648,8 +658,16 @@ async function handleMessage(
         // Use the most recent pending link; auto-resolve older stale ones
         const link = pendingLinks[pendingLinks.length - 1];
         if (pendingLinks.length > 1) {
+          const { permissions: stalePerms } = getBridgeContext();
           for (let i = 0; i < pendingLinks.length - 1; i++) {
-            try { store.markPermissionLinkResolved(pendingLinks[i].permissionRequestId); } catch { /* best effort */ }
+            const staleLink = pendingLinks[i];
+            const staleRealId = staleLink.permissionRequestId.replace(/_fallback$/, '');
+            stalePerms.resolvePendingPermission(staleRealId, {
+              behavior: 'deny',
+              message: 'Superseded by newer question',
+            });
+            try { store.markPermissionLinkResolved(staleLink.permissionRequestId); } catch { /* best effort */ }
+            try { store.markPermissionLinkResolved(staleRealId); } catch { /* best effort */ }
           }
         }
         const idx = parseInt(normalized, 10);
@@ -670,16 +688,30 @@ async function handleMessage(
         if (isAskQuestion && askData && idx - 1 < askData.options.length) {
           const selectedLabel = askData.options[idx - 1];
           const { permissions } = getBridgeContext();
-          const resolved = permissions.resolvePendingPermission(link.permissionRequestId, {
+          const realPermId = link.permissionRequestId.replace(/_fallback$/, '');
+          const resolved = permissions.resolvePendingPermission(realPermId, {
             behavior: 'allow',
             updatedInput: { answers: { [askData.questionText]: selectedLabel } },
           });
           if (resolved) {
-            // Edit the original question message to show selection result
+            // Patch the original form card to collapsed "answered" state
+            const formLink = store.getPermissionLink(realPermId);
+            if (formLink?.messageId && adapter.patchCardMessage) {
+              try {
+                const { buildAskUserAnsweredCard } = await import('./markdown/feishu.js');
+                const answeredCardJson = buildAskUserAnsweredCard(
+                  [{ question: askData.questionText }],
+                  { [askData.questionText]: selectedLabel },
+                );
+                await adapter.patchCardMessage(formLink.messageId, answeredCardJson);
+              } catch { /* best effort */ }
+            }
+            // Delete the fallback hint message
             if (adapter.editMessage && link.messageId) {
-              adapter.editMessage(link.messageId, `✅ ${askData.questionText} → ${selectedLabel}`).catch(() => {});
+              adapter.editMessage(link.messageId, '').catch(() => {});
             }
             try { store.markPermissionLinkResolved(link.permissionRequestId); } catch { /* best effort */ }
+            try { store.markPermissionLinkResolved(realPermId); } catch { /* best effort */ }
           }
           ack();
           return;
@@ -725,6 +757,17 @@ async function handleMessage(
     console.log(`[bridge-manager] contextOnly FILTERED: msgId=${msg.messageId} chatId=${msg.address.chatId} text=${JSON.stringify(msg.text?.slice(0, 100))}`);
     ack();
     return;
+  }
+
+  // Orchestration coordinator interception (group + user message + coordinator role)
+  if (msg.isGroup && msg.senderType !== 'bot' && !rawText.startsWith('/') && orchInterceptor) {
+    try {
+      const intercepted = await orchInterceptor(adapter, msg, getBridgeContext);
+      if (intercepted) {
+        ack();
+        return;
+      }
+    } catch { /* orchestration error, fall through to normal processing */ }
   }
 
   // Check for IM commands (before sanitization — commands are validated individually)
@@ -1063,6 +1106,13 @@ async function processRegularMessage(
         }
       } catch { /* best effort */ }
     }
+
+    // Orchestration: notify completion callback so worker can report results
+    if (orchCompletionCallback) {
+      try {
+        await orchCompletionCallback(msg.text || '', msg.address.chatId, result.responseText, result.hasError);
+      } catch { /* non-critical */ }
+    }
   } finally {
     // Clean up preview state
     if (previewState) {
@@ -1242,7 +1292,8 @@ async function handleCommand(
 
     case '/cwd': {
       if (!args) {
-        response = 'Usage: /cwd /path/to/directory';
+        const binding = router.resolve(msg.address);
+        response = `Current working directory: <code>${escapeHtml(binding.workingDirectory)}</code>`;
         break;
       }
       const validatedPath = validateWorkingDirectory(args);
@@ -1284,6 +1335,21 @@ async function handleCommand(
           } catch { /* ignore */ }
         }
         const lines = [`Current model: <code>${actualModel || 'default'}</code>`];
+
+        const llm = getBridgeContext().llm;
+        const models = typeof llm.listModels === 'function'
+          ? await llm.listModels().catch(() => [] as string[])
+          : [];
+        if (models.length > 0) {
+          lines.push('');
+          lines.push('Available:');
+          for (const m of models) {
+            const marker = m === actualModel ? ' ◀' : '';
+            lines.push(`  <code>${m}</code>${marker}`);
+          }
+        }
+
+        lines.push('');
         lines.push(`Usage: /model &lt;name&gt; · /model default to reset.`);
         response = lines.join('\n');
         break;
@@ -1356,6 +1422,11 @@ async function handleCommand(
           st.activeTasks.delete(oldBinding.codepilotSessionId);
         }
         router.bindToSession(msg.address, target.codepilotSessionId);
+        const bound = router.resolve(msg.address);
+        if (bound.codepilotSessionId !== target.codepilotSessionId) {
+          response = 'Session data not found (may have been cleaned up). Use `/new` to start a fresh session.';
+          break;
+        }
         response = `Resumed session <code>${target.codepilotSessionId.slice(0, 8)}...</code> (${escapeHtml(target.workingDirectory || '~')})`;
         break;
       }
@@ -1524,6 +1595,26 @@ import http from 'node:http';
 
 let relayServer: http.Server | null = null;
 
+// ── Orchestration hooks (registered by host application) ──────
+type OrchHandler = (data: unknown, getState: () => unknown, getBridgeContext: () => unknown) => Promise<void>;
+type OrchInterceptor = (adapter: BaseChannelAdapter, msg: InboundMessage, getBridgeContext: () => unknown) => Promise<boolean>;
+type OrchCompletionCallback = (msgText: string, chatId: string, responseText: string, hasError: boolean) => Promise<void>;
+let orchHandler: OrchHandler | null = null;
+let orchInterceptor: OrchInterceptor | null = null;
+let orchCompletionCallback: OrchCompletionCallback | null = null;
+
+export function registerOrchestrationHandler(handler: OrchHandler): void {
+  orchHandler = handler;
+}
+
+export function registerOrchestrationInterceptor(interceptor: OrchInterceptor): void {
+  orchInterceptor = interceptor;
+}
+
+export function registerOrchestrationCompletionCallback(cb: OrchCompletionCallback): void {
+  orchCompletionCallback = cb;
+}
+
 /** Parsed relay peers: name (lowercase) -> { host, port } */
 const relayPeers = new Map<string, { host: string; port: number }>();
 
@@ -1571,6 +1662,26 @@ export function startRelayServer(): void {
 
     try {
       const data = JSON.parse(body);
+
+      // Orchestration protocol: structured task/capability messages
+      if (data.protocol === 'orchestration') {
+        if (orchHandler) {
+          try {
+            await orchHandler(data, getState, getBridgeContext);
+            res.writeHead(200);
+            res.end('OK');
+          } catch (err) {
+            console.error('[relay-server] Orchestration handler error:', err);
+            res.writeHead(500);
+            res.end('Orchestration error');
+          }
+        } else {
+          res.writeHead(404);
+          res.end('Orchestration not enabled');
+        }
+        return;
+      }
+
       const { chatId, text, senderName, senderType, replyMessageId } = data;
       if (!chatId || !text) {
         res.writeHead(400);
