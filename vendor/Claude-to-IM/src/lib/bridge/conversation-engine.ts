@@ -232,6 +232,7 @@ async function consumeStream(
   let hasError = false;
   let errorMessage = '';
   const seenToolResultIds = new Set<string>();
+  const toolNameById = new Map<string, string>();
   const permissionRequests: PermissionRequestInfo[] = [];
   let capturedSdkSessionId: string | null = null;
   let capturedModel: string | undefined;
@@ -312,6 +313,7 @@ async function consumeStream(
                 name: toolData.name as string,
                 input: toolData.input as Record<string, unknown>,
               });
+              toolNameById.set(toolData.id as string, toolData.name as string);
               if (onToolEvent) {
                 try { onToolEvent(toolData.id as string, toolData.name as string, 'running'); } catch { /* non-critical */ }
               }
