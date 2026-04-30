@@ -18,6 +18,8 @@ import * as broker from './permission-broker.js';
 import { deliver } from './delivery-layer.js';
 import { getBridgeContext } from './context.js';
 import { escapeHtml } from './html-utils.js';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   validateWorkingDirectory,
   validateSessionId,
@@ -927,6 +929,31 @@ async function processRegularMessage(
     }
 
     const result = await engine.processMessage(binding, promptText, async (perm) => {
+      // ExitPlanMode: send plan content before the permission card
+      // so the user can read the plan before deciding to approve.
+      if (perm.toolName === 'ExitPlanMode' && binding.workingDirectory) {
+        try {
+          const plansDir = path.join(binding.workingDirectory, '.claude', 'plans');
+          const files = fs.readdirSync(plansDir)
+            .filter((f: string) => f.endsWith('.md'))
+            .map((f: string) => ({ name: f, mtime: fs.statSync(path.join(plansDir, f)).mtimeMs }))
+            .sort((a: { mtime: number }, b: { mtime: number }) => b.mtime - a.mtime);
+          if (files.length > 0) {
+            const content = fs.readFileSync(path.join(plansDir, files[0].name), 'utf-8').trim();
+            if (content) {
+              await deliver(adapter, {
+                address: msg.address,
+                text: `**Plan**\n\n${content}`,
+                parseMode: 'plain',
+                replyToMessageId: msg.messageId,
+              });
+            }
+          }
+        } catch (err) {
+          console.warn('[bridge-manager] Failed to read plan preview:', err);
+        }
+      }
+
       await broker.forwardPermissionRequest(
         adapter,
         msg.address,
@@ -1057,7 +1084,7 @@ async function processRegularMessage(
     // stale ID so the next message starts fresh instead of retrying a broken resume.
     if (binding.id) {
       try {
-        const update = computeSdkSessionUpdate(result.sdkSessionId, result.hasError);
+        const update = computeSdkSessionUpdate(result.sdkSessionId, result.hasError, result.errorMessage);
         if (update !== null) {
           store.updateChannelBinding(binding.id, { sdkSessionId: update });
         }
@@ -1242,7 +1269,8 @@ async function handleCommand(
 
     case '/cwd': {
       if (!args) {
-        response = 'Usage: /cwd /path/to/directory';
+        const binding = router.resolve(msg.address);
+        response = `Current working directory: <code>${escapeHtml(binding.workingDirectory)}</code>`;
         break;
       }
       const validatedPath = validateWorkingDirectory(args);
@@ -1272,19 +1300,30 @@ async function handleCommand(
     case '/model': {
       const binding = router.resolve(msg.address);
       if (!args) {
-        const rt = getBridgeContext().runtime;
-        // Resolve actual model: binding override > runtime default config
-        let actualModel = binding.model || '';
-        if (!actualModel && rt === 'codex') {
+        const { store: modelStore, runtime: rt } = getBridgeContext();
+        const session = modelStore.getSession(binding.codepilotSessionId);
+        // Resolve effective model through the full chain
+        let bindingModel = binding.model || '';
+        let sessionModel = session?.model || '';
+        let defaultModel = modelStore.getSetting('default_model') || '';
+        if (!bindingModel && !sessionModel && !defaultModel && rt === 'codex') {
           try {
             const tomlPath = require('path').join(require('os').homedir(), '.codex', 'config.toml');
             const toml = require('fs').readFileSync(tomlPath, 'utf-8');
             const match = toml.match(/^\s*model\s*=\s*"([^"]+)"/m);
-            if (match) actualModel = match[1];
+            if (match) defaultModel = match[1];
           } catch { /* ignore */ }
         }
-        const lines = [`Current model: <code>${actualModel || 'default'}</code>`];
-        lines.push(`Usage: /model &lt;name&gt; · /model default to reset.`);
+        const effective = bindingModel || sessionModel || defaultModel || 'default';
+        const lines = [`Current model: <code>${escapeHtml(effective)}</code>`];
+        if (sessionModel && sessionModel !== effective) {
+          lines.push(`Last used: <code>${escapeHtml(sessionModel)}</code>`);
+        }
+        const KNOWN_MODELS = rt === 'codex'
+          ? ['o4-mini', 'o3', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'codex-mini']
+          : ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'];
+        lines.push(`\nAvailable: ${KNOWN_MODELS.map(m => `<code>${m}</code>`).join(', ')}`);
+        lines.push(`\nUsage: /model &lt;name&gt; · /model default to reset.`);
         response = lines.join('\n');
         break;
       }
@@ -1334,7 +1373,10 @@ async function handleCommand(
     }
 
     case '/resume': {
+      const currentBinding = router.resolve(msg.address);
+      const currentCwd = currentBinding.workingDirectory || '';
       const bindings = router.listBindings(adapter.channelType)
+        .filter(b => !currentCwd || (b.workingDirectory || '') === currentCwd)
         .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
       if (bindings.length === 0) {
         response = 'No sessions to resume.';
@@ -1496,24 +1538,44 @@ async function handleCommand(
 
 // ── SDK Session Update Logic ─────────────────────────────────
 
+const SESSION_INVALIDATING_PATTERNS = [
+  'no such session',
+  'session not found',
+  'session expired',
+  'invalid session',
+  'resuming session with different model',
+  'not authenticated',
+  'authentication failed',
+  'unauthorized',
+  'organization does not have access',
+];
+
+function isSessionInvalidatingError(errorMessage: string): boolean {
+  const lower = errorMessage.toLowerCase();
+  return SESSION_INVALIDATING_PATTERNS.some(p => lower.includes(p));
+}
+
 /**
  * Compute the sdkSessionId value to persist after a conversation result.
  * Returns the new value to write, or null if no update is needed.
  *
- * Rules:
- * - If result has sdkSessionId AND no error → save the new ID
- * - If result has error (regardless of sdkSessionId) → clear to empty string
- * - Otherwise → no update needed
+ * Only clears the session ID for errors that truly invalidate the session
+ * (e.g. "no such session"). Recoverable errors (timeout, rate limit)
+ * preserve the existing session ID so the next message can resume.
  */
 export function computeSdkSessionUpdate(
   sdkSessionId: string | null | undefined,
   hasError: boolean,
+  errorMessage?: string,
 ): string | null {
-  if (sdkSessionId && !hasError) {
+  if (sdkSessionId) {
     return sdkSessionId;
   }
   if (hasError) {
-    return '';
+    if (errorMessage && isSessionInvalidatingError(errorMessage)) {
+      return '';
+    }
+    return null;
   }
   return null;
 }
