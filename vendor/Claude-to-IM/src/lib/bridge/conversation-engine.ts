@@ -101,9 +101,18 @@ export async function processMessage(
 
   store.setSessionRuntimeStatus(sessionId, 'running');
 
-  // Lock renewal interval
+  // Lock renewal with idle tracking for diagnostics.
+  let lastStreamActivity = Date.now();
+  const streamStartTime = Date.now();
   const renewalInterval = setInterval(() => {
-    try { store.renewSessionLock(sessionId, lockId, 600); } catch { /* best effort */ }
+    try {
+      store.renewSessionLock(sessionId, lockId, 600);
+      const idleSec = Math.round((Date.now() - lastStreamActivity) / 1000);
+      const totalSec = Math.round((Date.now() - streamStartTime) / 1000);
+      if (idleSec > 120) {
+        console.warn(`[conversation-engine] Stream idle for ${idleSec}s (total ${totalSec}s) session=${sessionId.slice(0, 8)}`);
+      }
+    } catch { /* best effort */ }
   }, 60_000);
 
   try {
@@ -200,7 +209,9 @@ export async function processMessage(
     // Consume the stream server-side (replicate collectStreamResponse pattern).
     // Permission requests are forwarded immediately via the callback during streaming
     // because the stream blocks until permission is resolved — we can't wait until after.
-    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onToolEvent, onAskUserQuestion);
+    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onToolEvent, onAskUserQuestion, {
+      onActivity: () => { lastStreamActivity = Date.now(); },
+    });
   } finally {
     clearInterval(renewalInterval);
     store.releaseSessionLock(sessionId, lockId);
@@ -219,6 +230,7 @@ async function consumeStream(
   onPartialText?: OnPartialText,
   onToolEvent?: OnToolEvent,
   onAskUserQuestion?: OnAskUserQuestion,
+  streamOpts?: { onActivity?: () => void },
 ): Promise<ConversationResult> {
   const { store } = getBridgeContext();
   const reader = stream.getReader();
@@ -241,6 +253,8 @@ async function consumeStream(
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+
+      if (streamOpts?.onActivity) streamOpts.onActivity();
 
       const lines = value.split('\n');
       for (const line of lines) {

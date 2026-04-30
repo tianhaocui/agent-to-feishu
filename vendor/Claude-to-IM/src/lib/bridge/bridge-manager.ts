@@ -1300,19 +1300,30 @@ async function handleCommand(
     case '/model': {
       const binding = router.resolve(msg.address);
       if (!args) {
-        const rt = getBridgeContext().runtime;
-        // Resolve actual model: binding override > runtime default config
-        let actualModel = binding.model || '';
-        if (!actualModel && rt === 'codex') {
+        const { store: modelStore, runtime: rt } = getBridgeContext();
+        const session = modelStore.getSession(binding.codepilotSessionId);
+        // Resolve effective model through the full chain
+        let bindingModel = binding.model || '';
+        let sessionModel = session?.model || '';
+        let defaultModel = modelStore.getSetting('default_model') || '';
+        if (!bindingModel && !sessionModel && !defaultModel && rt === 'codex') {
           try {
             const tomlPath = require('path').join(require('os').homedir(), '.codex', 'config.toml');
             const toml = require('fs').readFileSync(tomlPath, 'utf-8');
             const match = toml.match(/^\s*model\s*=\s*"([^"]+)"/m);
-            if (match) actualModel = match[1];
+            if (match) defaultModel = match[1];
           } catch { /* ignore */ }
         }
-        const lines = [`Current model: <code>${actualModel || 'default'}</code>`];
-        lines.push(`Usage: /model &lt;name&gt; · /model default to reset.`);
+        const effective = bindingModel || sessionModel || defaultModel || 'default';
+        const lines = [`Current model: <code>${escapeHtml(effective)}</code>`];
+        if (sessionModel && sessionModel !== effective) {
+          lines.push(`Last used: <code>${escapeHtml(sessionModel)}</code>`);
+        }
+        const KNOWN_MODELS = rt === 'codex'
+          ? ['o4-mini', 'o3', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'codex-mini']
+          : ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'];
+        lines.push(`\nAvailable: ${KNOWN_MODELS.map(m => `<code>${m}</code>`).join(', ')}`);
+        lines.push(`\nUsage: /model &lt;name&gt; · /model default to reset.`);
         response = lines.join('\n');
         break;
       }
@@ -1362,7 +1373,10 @@ async function handleCommand(
     }
 
     case '/resume': {
+      const currentBinding = router.resolve(msg.address);
+      const currentCwd = currentBinding.workingDirectory || '';
       const bindings = router.listBindings(adapter.channelType)
+        .filter(b => !currentCwd || (b.workingDirectory || '') === currentCwd)
         .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
       if (bindings.length === 0) {
         response = 'No sessions to resume.';
