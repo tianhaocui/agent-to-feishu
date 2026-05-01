@@ -44,7 +44,7 @@ jobs:
           DST_BRANCH="${{ github.event.pull_request.base.ref }}"
           REPO="${{ github.repository }}"
 
-          REVIEW=$(claude -p --model sonnet --allowedTools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Read,Grep,Glob" <<PROMPT
+          REVIEW=$(claude -p --model opus --allowedTools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Read,Grep,Glob" <<PROMPT
           请 review 这个 PR 的代码变更，给出中文评审意见。
 
           PR #${PR_NUMBER}: ${PR_TITLE}
@@ -74,4 +74,4 @@ jobs:
           ${REVIEW}
 
           ---
-          *Reviewed by Claude Sonnet*"
+          *Reviewed by Claude Opus*"
