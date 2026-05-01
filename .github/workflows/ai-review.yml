@@ -1,0 +1,77 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: AI Review
+        env:
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          SRC_BRANCH="${{ github.event.pull_request.head.ref }}"
+          DST_BRANCH="${{ github.event.pull_request.base.ref }}"
+          REPO="${{ github.repository }}"
+
+          REVIEW=$(claude -p --model sonnet --allowedTools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Read,Grep,Glob" <<PROMPT
+          请 review 这个 PR 的代码变更，给出中文评审意见。
+
+          PR #${PR_NUMBER}: ${PR_TITLE}
+          作者: ${PR_AUTHOR}
+          分支: ${SRC_BRANCH} → ${DST_BRANCH}
+
+          ## 规则
+          1. 本地仓库只读，禁止修改任何文件
+          2. 只允许 git diff、git log、git show 等只读命令
+          3. 用 git diff origin/${DST_BRANCH}...origin/${SRC_BRANCH} 查看变更
+
+          ## 评审维度
+          1. **逻辑正确性** - 代码逻辑是否正确，有无 bug
+          2. **安全性** - 有无安全漏洞（SQL注入、XSS、敏感信息泄露等）
+          3. **性能** - 有无明显性能问题（N+1查询、内存泄漏等）
+          4. **可维护性** - 代码是否清晰易懂，命名是否合理
+          5. **边界情况** - 是否处理了异常和边界场景
+
+          ## 输出格式
+          直接输出 markdown 格式的评审内容，不要包含任何前缀或解释。
+          如果没有问题，简短说明即可。如果有问题，按严重程度排列。
+          PROMPT
+          )
+
+          gh pr comment "$PR_NUMBER" --body "## AI Code Review
+
+          ${REVIEW}
+
+          ---
+          *Reviewed by Claude Sonnet*"
