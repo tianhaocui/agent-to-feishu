@@ -220,6 +220,12 @@ async function main(): Promise<void> {
     writeStatus({ running: false, lastExitReason: `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}` });
   });
   process.on('uncaughtException', (err) => {
+    // EPIPE happens when writing to a closed pipe (e.g. Claude Code child process exited).
+    // Not fatal — log and continue.
+    if ('code' in err && (err as NodeJS.ErrnoException).code === 'EPIPE') {
+      console.warn('[claude-to-im] EPIPE (non-fatal, child process likely exited):', err.message);
+      return;
+    }
     console.error('[claude-to-im] uncaughtException:', err.stack || err.message);
     writeStatus({ running: false, lastExitReason: `uncaughtException: ${err.message}` });
     process.exit(1);
