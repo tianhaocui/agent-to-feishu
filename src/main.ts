@@ -216,10 +216,21 @@ async function main(): Promise<void> {
 
   // ── Exit diagnostics ──
   process.on('unhandledRejection', (reason) => {
+    if (reason instanceof Error && (reason as NodeJS.ErrnoException).code === 'EPIPE') {
+      console.warn('[claude-to-im] EPIPE in promise (non-fatal):', reason.message);
+      return;
+    }
     console.error('[claude-to-im] unhandledRejection:', reason instanceof Error ? reason.stack || reason.message : reason);
     writeStatus({ running: false, lastExitReason: `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}` });
   });
   process.on('uncaughtException', (err) => {
+    // EPIPE is a race condition: SDK child process exits, its stdin closes, but a pending
+    // write lands before the 'close'/'exit' event cleans up the stream reference.
+    // Safe to continue — the SDK's process exit handler will clean up the child.
+    if ((err as NodeJS.ErrnoException).code === 'EPIPE') {
+      console.warn('[claude-to-im] EPIPE (non-fatal, child process likely exited):', err.message);
+      return;
+    }
     console.error('[claude-to-im] uncaughtException:', err.stack || err.message);
     writeStatus({ running: false, lastExitReason: `uncaughtException: ${err.message}` });
     process.exit(1);
