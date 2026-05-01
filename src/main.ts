@@ -216,13 +216,15 @@ async function main(): Promise<void> {
 
   // ── Exit diagnostics ──
   process.on('unhandledRejection', (reason) => {
+    if (reason instanceof Error && (reason as NodeJS.ErrnoException).code === 'EPIPE') {
+      console.warn('[claude-to-im] EPIPE in promise (non-fatal):', reason.message);
+      return;
+    }
     console.error('[claude-to-im] unhandledRejection:', reason instanceof Error ? reason.stack || reason.message : reason);
     writeStatus({ running: false, lastExitReason: `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}` });
   });
   process.on('uncaughtException', (err) => {
-    // EPIPE happens when writing to a closed pipe (e.g. Claude Code child process exited).
-    // Not fatal — log and continue.
-    if ('code' in err && (err as NodeJS.ErrnoException).code === 'EPIPE') {
+    if ((err as NodeJS.ErrnoException).code === 'EPIPE') {
       console.warn('[claude-to-im] EPIPE (non-fatal, child process likely exited):', err.message);
       return;
     }
