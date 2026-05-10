@@ -442,6 +442,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
+  public unregisterPeerBot(name: string): void {
+    const key = name.toLowerCase();
+    const openId = this.knownBots.get(key);
+    if (openId) {
+      this.knownBots.delete(key);
+      this.knownBotsByOpenId.delete(openId);
+    }
+  }
+
   // ── Typing indicator (Openclaw-style reaction) ─────────────
 
   /**
@@ -1092,6 +1101,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!state || !this.restClient) return undefined;
 
     await state.flush.waitForFlush();
+
+    // Re-check after await — state may have been deleted by /stop or concurrent operation
+    if (this.activeCards.get(chatId) !== state) return undefined;
+
     const cardMessageId = state.messageId || undefined;
 
     const effectiveCardId = state.cardId ?? state.originalCardId;

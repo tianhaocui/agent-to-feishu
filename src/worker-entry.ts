@@ -134,6 +134,11 @@ async function main(): Promise<void> {
         adapter.registerPeerBot(msg.name, msg.openId);
         console.log(`[worker:${botName}] Registered peer: ${msg.name} -> ${msg.openId}`);
       }
+    } else if (msg.type === 'peer-reset' && msg.name) {
+      if (adapter?.unregisterPeerBot) {
+        adapter.unregisterPeerBot(msg.name);
+        console.log(`[worker:${botName}] Cleared stale peer: ${msg.name}`);
+      }
     }
   });
 

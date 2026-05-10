@@ -48,10 +48,40 @@ function loadBots(): BotEntry[] {
     console.error(`[orchestrator] bots.json not found at ${BOTS_CONFIG}`);
     process.exit(1);
   }
-  const bots: BotEntry[] = JSON.parse(fs.readFileSync(BOTS_CONFIG, 'utf-8'));
-  if (!Array.isArray(bots) || bots.length === 0) {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(fs.readFileSync(BOTS_CONFIG, 'utf-8'));
+  } catch (err) {
+    console.error(`[orchestrator] bots.json is not valid JSON: ${err instanceof Error ? err.message : err}`);
+    process.exit(1);
+  }
+  if (!Array.isArray(raw) || raw.length === 0) {
     console.error('[orchestrator] bots.json must be a non-empty array');
     process.exit(1);
+  }
+  const bots: BotEntry[] = [];
+  const names = new Set<string>();
+  for (let i = 0; i < raw.length; i++) {
+    const entry = raw[i];
+    if (!entry || typeof entry.name !== 'string' || !entry.name.trim()) {
+      console.error(`[orchestrator] bots.json[${i}]: missing or invalid "name" field`);
+      process.exit(1);
+    }
+    if (typeof entry.ctiHome !== 'string' || !entry.ctiHome.trim()) {
+      console.error(`[orchestrator] bots.json[${i}]: missing or invalid "ctiHome" field`);
+      process.exit(1);
+    }
+    if (!fs.existsSync(entry.ctiHome)) {
+      console.error(`[orchestrator] bots.json[${i}]: ctiHome directory does not exist: ${entry.ctiHome}`);
+      process.exit(1);
+    }
+    const key = entry.name.trim().toLowerCase();
+    if (names.has(key)) {
+      console.error(`[orchestrator] bots.json: duplicate bot name "${entry.name}"`);
+      process.exit(1);
+    }
+    names.add(key);
+    bots.push({ name: entry.name.trim(), ctiHome: entry.ctiHome });
   }
   return bots;
 }
@@ -98,10 +128,13 @@ function spawnWorker(bot: BotEntry): Worker {
   w.on('message', (msg: WorkerMessage) => {
     if (msg.type === 'relay') {
       const target = workers.get(msg.target.toLowerCase());
+      const correlationId = (msg as any).correlationId;
       if (target) {
         target.postMessage(msg);
+        if (correlationId) w.postMessage({ type: 'relay-ack', correlationId });
       } else {
         console.warn(`[orchestrator] Relay target not found: ${msg.target}`);
+        if (correlationId) w.postMessage({ type: 'relay-nack', correlationId });
       }
     } else if (msg.type === 'identity') {
       for (const [name, worker] of workers) {
@@ -119,6 +152,12 @@ function spawnWorker(bot: BotEntry): Worker {
   w.on('exit', (code) => {
     console.warn(`[orchestrator] Worker ${bot.name} exited (code: ${code})`);
     workers.delete(bot.name.toLowerCase());
+
+    // Notify remaining workers to clear stale identity for this bot
+    for (const [, worker] of workers) {
+      worker.postMessage({ type: 'peer-reset', name: bot.name });
+    }
+
     if (!shuttingDown) {
       const botKey = bot.name.toLowerCase();
       recordExit(botKey);
@@ -138,7 +177,7 @@ function spawnWorker(bot: BotEntry): Worker {
 
 let shuttingDown = false;
 
-async function shutdown(signal?: string): Promise<void> {
+async function shutdown(signal?: string, exitCode = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   const reason = signal ? `signal: ${signal}` : 'shutdown requested';
@@ -150,7 +189,7 @@ async function shutdown(signal?: string): Promise<void> {
   await Promise.allSettled(terminatePromises);
 
   writeStatus({ running: false, lastExitReason: reason });
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 function main(): void {
@@ -179,8 +218,7 @@ function main(): void {
 
   process.on('uncaughtException', (err) => {
     console.error('[orchestrator] uncaughtException:', err.stack || err.message);
-    writeStatus({ running: false, lastExitReason: `uncaughtException: ${err.message}` });
-    process.exit(1);
+    shutdown(`uncaughtException: ${err.message}`, 1);
   });
 
   setInterval(() => { /* keepalive */ }, 45_000);

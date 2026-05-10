@@ -17,7 +17,7 @@ import * as engine from './conversation-engine.js';
 import * as broker from './permission-broker.js';
 import { deliver } from './delivery-layer.js';
 import { getBridgeContext } from './context.js';
-import { splitByMentions } from './mention-utils.js';
+import { splitByMentions, MentionMatcher } from './mention-utils.js';
 import type { MentionSegment } from './mention-utils.js';
 import { escapeHtml } from './html-utils.js';
 import fs from 'node:fs';
@@ -887,6 +887,8 @@ async function processRegularMessage(
     splitCount: 0,
     relayedSegments: [] as { targetBot: string; text: string }[],
     splitQueue: Promise.resolve() as Promise<void>,
+    cachedMatcher: null as MentionMatcher | null,
+    cachedBotSetKey: '',
   } : null;
 
   // Combined partial text callback: streaming preview + streaming cards + mention split
@@ -902,7 +904,12 @@ async function processRegularMessage(
         ...getRelayPeerNames(),
       ]);
       if (allBots.size > 0) {
-        const allSegments = splitByMentions(textOnly, allBots);
+        const botSetKey = [...allBots].sort().join('\0');
+        if (botSetKey !== mentionTracker.cachedBotSetKey) {
+          mentionTracker.cachedMatcher = new MentionMatcher(allBots);
+          mentionTracker.cachedBotSetKey = botSetKey;
+        }
+        const allSegments = mentionTracker.cachedMatcher!.split(textOnly);
         const mentionIndices = allSegments
           .map((s, i) => s.targetBot !== null ? i : -1)
           .filter(i => i >= 0);
@@ -913,8 +920,17 @@ async function processRegularMessage(
             const seg = allSegments[idx];
             mentionTracker.splitCount++;
             mentionTracker.relayedSegments.push({ targetBot: seg.targetBot!, text: seg.text });
-            const upToHere = allSegments.slice(0, idx + 1).map(s => s.text).join('\n\n');
-            mentionTracker.splitOffset = upToHere.length + 2;
+
+            // Find actual position in original text (avoids drift from multi-newline collapse)
+            const segStart = textOnly.indexOf(seg.text, mentionTracker.splitOffset);
+            if (segStart >= 0) {
+              const segEnd = segStart + seg.text.length;
+              const trailing = textOnly.slice(segEnd).match(/^\n+/);
+              mentionTracker.splitOffset = segEnd + (trailing?.[0].length || 0);
+            } else {
+              const upToHere = allSegments.slice(0, idx + 1).map(s => s.text).join('\n\n');
+              mentionTracker.splitOffset = upToHere.length + 2;
+            }
 
             const myName = adapter.botName || 'unknown';
             mentionTracker.splitQueue = mentionTracker.splitQueue.then(async () => {
@@ -1645,6 +1661,22 @@ import { parentPort, isMainThread } from 'node:worker_threads';
 
 let relayServer: http.Server | null = null;
 
+// Pending relay ack/nack tracking for Worker thread mode
+const pendingRelays = new Map<string, { resolve: (ok: boolean) => void; timer: ReturnType<typeof setTimeout> }>();
+
+if (!isMainThread && parentPort) {
+  parentPort.on('message', (msg: any) => {
+    if (msg.type === 'relay-ack' || msg.type === 'relay-nack') {
+      const pending = pendingRelays.get(msg.correlationId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pendingRelays.delete(msg.correlationId);
+        pending.resolve(msg.type === 'relay-ack');
+      }
+    }
+  });
+}
+
 /** Parsed relay peers: name (lowercase) -> { host, port } */
 const relayPeers = new Map<string, { host: string; port: number }>();
 
@@ -1786,14 +1818,23 @@ export function getRelayPeerNames(): string[] {
  * Returns true if the message was sent successfully.
  */
 export async function relayToBot(botName: string, chatId: string, text: string, senderName: string, replyMessageId?: string): Promise<boolean> {
-  // Worker thread mode: relay via parentPort to orchestrator
+  // Worker thread mode: relay via parentPort to orchestrator with ack/nack
   if (!isMainThread && parentPort) {
-    parentPort.postMessage({
-      type: 'relay',
-      target: botName.toLowerCase(),
-      payload: { chatId, text, senderName, senderType: 'bot', replyMessageId },
+    const correlationId = `relay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        pendingRelays.delete(correlationId);
+        console.warn(`[relay] Timeout waiting for ack: ${botName}`);
+        resolve(false);
+      }, 5000);
+      pendingRelays.set(correlationId, { resolve, timer });
+      parentPort!.postMessage({
+        type: 'relay',
+        target: botName.toLowerCase(),
+        correlationId,
+        payload: { chatId, text, senderName, senderType: 'bot', replyMessageId },
+      });
     });
-    return true;
   }
 
   const peer = relayPeers.get(botName.toLowerCase());
