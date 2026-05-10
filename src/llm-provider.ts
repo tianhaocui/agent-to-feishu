@@ -630,7 +630,9 @@ export class SDKLLMProvider implements LLMProvider {
 
                     const result = await pendingPerms.waitFor(opts.toolUseID);
                     if (result.behavior === 'allow') {
-                      return { behavior: 'allow' as const, updatedInput: result.updatedInput || input };
+                      // Merge answers into the original input (which has questions)
+                      const merged = { ...input, ...result.updatedInput };
+                      return { behavior: 'allow' as const, updatedInput: merged };
                     }
                     return { behavior: 'deny' as const, message: result.message || 'Denied by user' };
                   }

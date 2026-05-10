@@ -36,6 +36,9 @@ async function main(): Promise<void> {
   const { setupLogger } = await import('./logger.js');
 
   const config = loadConfig();
+  // Relay server is handled by the orchestrator — workers must not bind it
+  config.relayPort = undefined;
+  config.relayPeers = undefined;
   setupLogger();
 
   const runId = crypto.randomUUID();

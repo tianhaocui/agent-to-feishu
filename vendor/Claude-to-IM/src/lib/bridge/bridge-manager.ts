@@ -467,27 +467,22 @@ async function handleMessage(
       const answers: Record<string, string> = {};
       for (let i = 0; i < questions.length; i++) {
         const q = questions[i];
-        const rawValue = msg.formValue[`q_${i}`];
-        if (rawValue === undefined || rawValue === null) continue;
-
-        // Check if user typed a custom answer (takes priority over dropdown)
-        const customKey = `q_${i}_custom`;
-        const customValue = msg.formValue[customKey];
+        const customValue = msg.formValue[`q_${i}_custom`];
         if (typeof customValue === 'string' && customValue.trim()) {
           answers[q.question] = customValue.trim();
           continue;
         }
 
+        const rawValue = msg.formValue[`q_${i}`];
+        if (rawValue === undefined || rawValue === null) continue;
+
         if (q.multiSelect && Array.isArray(rawValue)) {
-          // Multi-select: values are "opt_N_label", extract labels
           const labels = rawValue.map((v: string) => v.replace(/^opt_\d+_/, ''));
           answers[q.question] = labels.join(', ');
         } else if (typeof rawValue === 'string') {
           if (rawValue.startsWith('opt_')) {
-            // Single-select: "opt_N_label"
             answers[q.question] = rawValue.replace(/^opt_\d+_/, '');
           } else {
-            // Free-text input
             answers[q.question] = rawValue;
           }
         }
