@@ -218,6 +218,9 @@ function main(): void {
 
   process.on('uncaughtException', (err) => {
     console.error('[orchestrator] uncaughtException:', err.stack || err.message);
+    // Attempt graceful shutdown with a hard deadline — event loop may be damaged
+    const forceTimer = setTimeout(() => process.exit(1), 3000);
+    forceTimer.unref();
     shutdown(`uncaughtException: ${err.message}`, 1);
   });
 

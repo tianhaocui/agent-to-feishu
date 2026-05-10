@@ -60,7 +60,6 @@ function getStreamConfig(channelType = 'feishu'): StreamConfig {
   return { intervalMs, minDeltaChars, maxChars };
 }
 
-// splitByMentions imported from ./mention-utils.js
 
 /**
  * Check if a message looks like a numeric permission shortcut (1/2/3) for
@@ -887,6 +886,7 @@ async function processRegularMessage(
     splitCount: 0,
     relayedSegments: [] as { targetBot: string; text: string }[],
     splitQueue: Promise.resolve() as Promise<void>,
+    splitting: false,
     cachedMatcher: null as MentionMatcher | null,
     cachedBotSetKey: '',
   } : null;
@@ -921,29 +921,33 @@ async function processRegularMessage(
             mentionTracker.splitCount++;
             mentionTracker.relayedSegments.push({ targetBot: seg.targetBot!, text: seg.text });
 
-            // Find actual position in original text (avoids drift from multi-newline collapse)
-            const segStart = textOnly.indexOf(seg.text, mentionTracker.splitOffset);
-            if (segStart >= 0) {
-              const segEnd = segStart + seg.text.length;
-              const trailing = textOnly.slice(segEnd).match(/^\n+/);
-              mentionTracker.splitOffset = segEnd + (trailing?.[0].length || 0);
-            } else {
-              const upToHere = allSegments.slice(0, idx + 1).map(s => s.text).join('\n\n');
-              mentionTracker.splitOffset = upToHere.length + 2;
+            // Cumulative offset: sum lengths of segments up to and including this one
+            let cumOffset = 0;
+            for (let si = 0; si <= idx; si++) {
+              if (si > 0) cumOffset += 2; // \n\n separator
+              cumOffset += allSegments[si].text.length;
             }
+            // Skip trailing newlines in original text after this segment
+            const afterCum = textOnly.slice(cumOffset);
+            const trailingNl = afterCum.match(/^\n+/);
+            mentionTracker.splitOffset = cumOffset + (trailingNl?.[0].length || 2);
 
+            mentionTracker.splitting = true;
             const myName = adapter.botName || 'unknown';
             mentionTracker.splitQueue = mentionTracker.splitQueue.then(async () => {
               try {
                 const cardMsgId = await (adapter as any).splitStreamingCard?.(msg.address.chatId, seg.text);
                 await relayToBot(seg.targetBot!, msg.address.chatId, seg.text, myName, cardMsgId);
               } catch { /* logged elsewhere */ }
-            });
+            }).finally(() => { mentionTracker.splitting = false; });
             console.log(`[bridge-manager] Card-split: finalized card for @${seg.targetBot} (${seg.text.length} chars)`);
           }
         }
       }
     }
+
+    // Suppress card updates while a split operation is in progress
+    if (mentionTracker?.splitting) return;
 
     // Pass only current segment text to card (after split offset)
     const cardText = mentionTracker && mentionTracker.splitOffset > 0
@@ -1672,6 +1676,8 @@ if (!isMainThread && parentPort) {
         clearTimeout(pending.timer);
         pendingRelays.delete(msg.correlationId);
         pending.resolve(msg.type === 'relay-ack');
+      } else {
+        console.warn(`[relay] Late ${msg.type} for ${msg.correlationId} (already timed out)`);
       }
     }
   });
@@ -1826,7 +1832,7 @@ export async function relayToBot(botName: string, chatId: string, text: string, 
         pendingRelays.delete(correlationId);
         console.warn(`[relay] Timeout waiting for ack: ${botName}`);
         resolve(false);
-      }, 5000);
+      }, 10_000);
       pendingRelays.set(correlationId, { resolve, timer });
       parentPort!.postMessage({
         type: 'relay',

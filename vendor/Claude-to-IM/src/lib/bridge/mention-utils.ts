@@ -47,14 +47,19 @@ export function splitByMentions(text: string, knownBots: Set<string>): MentionSe
 export class MentionMatcher {
   private combinedRe: RegExp | null;
   private botSet: Set<string>;
+  private botNameMap: Map<string, string>; // lowercase -> original
 
   constructor(knownBots: Set<string>) {
     this.botSet = knownBots;
+    this.botNameMap = new Map();
+    for (const name of knownBots) {
+      this.botNameMap.set(name.toLowerCase(), name);
+    }
     if (knownBots.size === 0) {
       this.combinedRe = null;
     } else {
       const alternatives = [...knownBots].map(escapeRegex).join('|');
-      this.combinedRe = new RegExp(`^@(?:\\[(${alternatives})\\]|(${alternatives})(?![\\w]))`);
+      this.combinedRe = new RegExp(`^@(?:\\[(${alternatives})\\]|(${alternatives})(?![\\w]))`, 'i');
     }
   }
 
@@ -65,8 +70,9 @@ export class MentionMatcher {
     let current: MentionSegment = { targetBot: null, text: '' };
     for (const para of paragraphs) {
       const m = para.match(this.combinedRe);
-      const mentionedBot = m ? (m[1] || m[2]) : null;
-      if (mentionedBot && this.botSet.has(mentionedBot)) {
+      const rawBot = m ? (m[1] || m[2]) : null;
+      const mentionedBot = rawBot ? (this.botNameMap.get(rawBot.toLowerCase()) || null) : null;
+      if (mentionedBot) {
         if (current.text.trim()) segments.push(current);
         current = { targetBot: mentionedBot, text: para };
       } else if (current.targetBot !== null) {

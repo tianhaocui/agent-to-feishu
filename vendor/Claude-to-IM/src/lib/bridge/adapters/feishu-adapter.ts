@@ -116,8 +116,6 @@ interface StreamingCardState {
   guard: import('../unavailable-guard.js').UnavailableGuard | null;
 }
 
-// splitByMentions imported from ../mention-utils.js
-
 /** Abort text patterns for fast-path detection. */
 const ABORT_PATTERNS = /^(\/stop|stop|停止|取消|abort|cancel)$/i;
 
