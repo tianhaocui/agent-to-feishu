@@ -119,6 +119,37 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// ── @mention segment splitting for multi-bot relay ──
+
+interface MentionSegment { targetBot: string | null; text: string; }
+
+function splitByMentions(text: string, knownBots: Set<string>): MentionSegment[] {
+  const paragraphs = text.split(/\n\n+/);
+  const segments: MentionSegment[] = [];
+  let current: MentionSegment = { targetBot: null, text: '' };
+  for (const para of paragraphs) {
+    const bracketMatch = para.match(/^@\[([^\]]+)\]/);
+    let mentionedBot = bracketMatch?.[1] || null;
+    if (!mentionedBot) {
+      for (const name of knownBots) {
+        const re = new RegExp(`^@${escapeRegex(name)}(?![\\w])`);
+        if (re.test(para)) { mentionedBot = name; break; }
+      }
+    }
+    if (mentionedBot && knownBots.has(mentionedBot)) {
+      if (current.text.trim()) segments.push(current);
+      current = { targetBot: mentionedBot, text: para };
+    } else if (current.targetBot !== null) {
+      segments.push(current);
+      current = { targetBot: null, text: para };
+    } else {
+      current.text += (current.text ? '\n\n' : '') + para;
+    }
+  }
+  if (current.text.trim()) segments.push(current);
+  return segments;
+}
+
 /** Abort text patterns for fast-path detection. */
 const ABORT_PATTERNS = /^(\/stop|stop|停止|取消|abort|cancel)$/i;
 
@@ -1079,13 +1110,85 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.updateToolProgress(chatId, tools);
   }
 
+  knownBotNames(): string[] {
+    return [...this.knownBots.keys()];
+  }
+
+  /**
+   * Split the current streaming card mid-stream: finalize it with segmentText,
+   * then create a new streaming card for subsequent content.
+   * Returns the finalized card's message ID (for relay threading).
+   */
+  async splitStreamingCard(chatId: string, segmentText: string): Promise<string | undefined> {
+    const state = this.activeCards.get(chatId);
+    if (!state || !this.restClient) return undefined;
+
+    await state.flush.waitForFlush();
+    const cardMessageId = state.messageId || undefined;
+
+    const effectiveCardId = state.cardId ?? state.originalCardId;
+    if (effectiveCardId && state.messageId) {
+      try {
+        state.sequence++;
+        await setCardStreamingMode(this.restClient, effectiveCardId, false, state.sequence);
+
+        const displayText = this.resolveOutboundMentions(segmentText, 'card');
+        const finalCardJson = buildFinalCardJson(displayText, [], {
+          status: 'completed',
+          elapsed: formatElapsed(Date.now() - state.startTime),
+        });
+        state.sequence++;
+        await updateCardKitCard(this.restClient, effectiveCardId, JSON.parse(finalCardJson), state.sequence);
+      } catch (err) {
+        console.warn('[feishu-adapter] splitStreamingCard finalize failed:', err instanceof Error ? err.message : err);
+      }
+    }
+
+    if (state.toolHeartbeat) { clearInterval(state.toolHeartbeat); state.toolHeartbeat = null; }
+    state.flush.cancelPendingFlush();
+    state.flush.complete();
+    this.activeCards.delete(chatId);
+
+    const replyToMessageId = this.lastIncomingMessageId.get(chatId);
+    await this.createStreamingCard(chatId, replyToMessageId);
+
+    return cardMessageId;
+  }
+
   async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string, meta?: import('../channel-adapter.js').StreamEndMeta): Promise<boolean> {
-    // Capture the card's Feishu message ID before finalizeCard cleans up activeCards
+    // Check if streaming card-split was active (set by bridge-manager)
+    const splitInfo = (this as any)._streamSplitActive as { chatId: string; relayed: { targetBot: string; text: string }[]; splitOffset: number } | undefined;
+    delete (this as any)._streamSplitActive;
+
     const cardMessageId = this.activeCards.get(chatId)?.messageId || undefined;
+
+    if (splitInfo && splitInfo.chatId === chatId && status === 'completed' && responseText) {
+      // Card-split path: finalize last card with only the last segment's text
+      const { relayToBot, getRelayPeerNames } = await import('../bridge-manager.js');
+      const allBots = new Set([...this.knownBots.keys(), ...getRelayPeerNames()]);
+      const segments = splitByMentions(responseText, allBots);
+      const botSegments = segments.filter(s => s.targetBot !== null);
+      const lastSeg = botSegments[botSegments.length - 1];
+
+      const lastSegText = lastSeg?.text || responseText.slice(splitInfo.splitOffset);
+      const result = await this.finalizeCard(chatId, status, lastSegText, meta);
+
+      if (lastSeg) {
+        const myName = this.knownBotsByOpenId.get(this.botOpenId || '') || 'unknown';
+        try {
+          await relayToBot(lastSeg.targetBot!, chatId, lastSeg.text, myName, cardMessageId);
+          console.log(`[feishu-adapter] Final split-relay to ${lastSeg.targetBot} (${lastSeg.text.length} chars)`);
+        } catch (err) {
+          console.warn(`[feishu-adapter] Final split-relay error:`, err);
+        }
+      }
+      return result;
+    }
+
+    // Normal path (no split)
     const result = await this.finalizeCard(chatId, status, responseText, meta);
 
     // Multi-bot: relay mentions to peer bots via HTTP (group chats only)
-    // Match both @[BotName] and @BotName (for known bots)
     const multiBotEnabled = getBridgeContext().store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
     if (multiBotEnabled && status === 'completed' && responseText && this.groupChatIds.has(chatId)) {
       const { relayToBot, getRelayPeerNames } = await import('../bridge-manager.js');

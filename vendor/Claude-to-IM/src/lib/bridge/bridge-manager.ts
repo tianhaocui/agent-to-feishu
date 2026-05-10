@@ -58,6 +58,37 @@ function getStreamConfig(channelType = 'feishu'): StreamConfig {
   return { intervalMs, minDeltaChars, maxChars };
 }
 
+// ── @mention segment splitting for multi-bot card relay ──
+
+interface MentionSegment { targetBot: string | null; text: string; }
+
+function splitByMentionsBM(text: string, knownBots: Set<string>): MentionSegment[] {
+  const paragraphs = text.split(/\n\n+/);
+  const segments: MentionSegment[] = [];
+  let current: MentionSegment = { targetBot: null, text: '' };
+  for (const para of paragraphs) {
+    const bracketMatch = para.match(/^@\[([^\]]+)\]/);
+    let mentionedBot = bracketMatch?.[1] || null;
+    if (!mentionedBot) {
+      for (const name of knownBots) {
+        const re = new RegExp(`^@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w])`);
+        if (re.test(para)) { mentionedBot = name; break; }
+      }
+    }
+    if (mentionedBot && knownBots.has(mentionedBot)) {
+      if (current.text.trim()) segments.push(current);
+      current = { targetBot: mentionedBot, text: para };
+    } else if (current.targetBot !== null) {
+      segments.push(current);
+      current = { targetBot: null, text: para };
+    } else {
+      current.text += (current.text ? '\n\n' : '') + para;
+    }
+  }
+  if (current.text.trim()) segments.push(current);
+  return segments;
+}
+
 /**
  * Check if a message looks like a numeric permission shortcut (1/2/3) for
  * feishu channels WITH at least one pending permission in that chat.
@@ -852,8 +883,8 @@ async function processRegularMessage(
   const hasStreamingCards = typeof adapter.onStreamText === 'function';
   const toolCallTracker = new Map<string, ToolCallInfo>();
 
-  const onStreamCardText = hasStreamingCards ? (fullText: string) => {
-    try { adapter.onStreamText!(msg.address.chatId, fullText); } catch { /* non-critical */ }
+  const onStreamCardText = hasStreamingCards ? (cardText: string) => {
+    try { adapter.onStreamText!(msg.address.chatId, cardText); } catch { /* non-critical */ }
   } : undefined;
 
   const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => {
@@ -875,10 +906,58 @@ async function processRegularMessage(
     } catch { /* non-critical */ }
   } : undefined;
 
-  // Combined partial text callback: streaming preview + streaming cards
-  const onPartialText = (previewOnPartialText || onStreamCardText) ? (fullText: string) => {
+  // ── Streaming card-split tracker (multi-bot @mention) ──
+  const multiBotSplit = msg.isGroup && store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
+  const mentionTracker = multiBotSplit ? {
+    lastText: '',
+    splitOffset: 0,
+    splitCount: 0,
+    relayedSegments: [] as { targetBot: string; text: string }[],
+  } : null;
+
+  // Combined partial text callback: streaming preview + streaming cards + mention split
+  const onPartialText = (previewOnPartialText || onStreamCardText || mentionTracker) ? (fullText: string) => {
     if (previewOnPartialText) previewOnPartialText(fullText);
-    if (onStreamCardText) onStreamCardText(fullText);
+
+    const textOnly = fullText.replace(/^<think>[\s\S]*?<\/think>\s*/, '');
+
+    if (mentionTracker && textOnly.length > mentionTracker.lastText.length) {
+      mentionTracker.lastText = textOnly;
+      const allBots = new Set([
+        ...((adapter as any).knownBotNames?.() || []),
+        ...getRelayPeerNames(),
+      ]);
+      if (allBots.size > 0) {
+        const allSegments = splitByMentionsBM(textOnly, allBots);
+        const mentionIndices = allSegments
+          .map((s, i) => s.targetBot !== null ? i : -1)
+          .filter(i => i >= 0);
+
+        for (let mi = mentionTracker.splitCount; mi < mentionIndices.length; mi++) {
+          const idx = mentionIndices[mi];
+          if (idx < allSegments.length - 1) {
+            const seg = allSegments[idx];
+            mentionTracker.splitCount++;
+            mentionTracker.relayedSegments.push({ targetBot: seg.targetBot!, text: seg.text });
+            const upToHere = allSegments.slice(0, idx + 1).map(s => s.text).join('\n\n');
+            mentionTracker.splitOffset = upToHere.length + 2;
+
+            const myName = adapter.botName || 'unknown';
+            (adapter as any).splitStreamingCard?.(msg.address.chatId, seg.text)
+              .then((cardMsgId: string | undefined) => {
+                relayToBot(seg.targetBot!, msg.address.chatId, seg.text, myName, cardMsgId).catch(() => {});
+              }).catch(() => {});
+            console.log(`[bridge-manager] Card-split: finalized card for @${seg.targetBot} (${seg.text.length} chars)`);
+          }
+        }
+      }
+    }
+
+    // Pass only current segment text to card (after split offset)
+    const cardText = mentionTracker && mentionTracker.splitOffset > 0
+      ? textOnly.slice(mentionTracker.splitOffset)
+      : fullText;
+    if (onStreamCardText) onStreamCardText(cardText);
   } : undefined;
 
   try {
@@ -1046,6 +1125,14 @@ async function processRegularMessage(
     // was actually finalized (meaning content is already visible to the user).
     let cardFinalized = false;
     if (hasStreamingCards && adapter.onStreamEnd) {
+      // Pass split info so adapter knows which segments were already relayed
+      if (mentionTracker && mentionTracker.relayedSegments.length > 0) {
+        (adapter as any)._streamSplitActive = {
+          chatId: msg.address.chatId,
+          relayed: mentionTracker.relayedSegments,
+          splitOffset: mentionTracker.splitOffset,
+        };
+      }
       const meta = {
         tokenUsage: result.tokenUsage ? {
           input: result.tokenUsage.input_tokens ?? 0,
@@ -1583,6 +1670,7 @@ export function computeSdkSessionUpdate(
 // ── Relay Server for Multi-Bot Communication ────────────────
 
 import http from 'node:http';
+import { parentPort, isMainThread } from 'node:worker_threads';
 
 let relayServer: http.Server | null = null;
 
@@ -1727,6 +1815,16 @@ export function getRelayPeerNames(): string[] {
  * Returns true if the message was sent successfully.
  */
 export async function relayToBot(botName: string, chatId: string, text: string, senderName: string, replyMessageId?: string): Promise<boolean> {
+  // Worker thread mode: relay via parentPort to orchestrator
+  if (!isMainThread && parentPort) {
+    parentPort.postMessage({
+      type: 'relay',
+      target: botName.toLowerCase(),
+      payload: { chatId, text, senderName, senderType: 'bot', replyMessageId },
+    });
+    return true;
+  }
+
   const peer = relayPeers.get(botName.toLowerCase());
   if (!peer) {
     console.warn(`[relay-server] Unknown peer bot: ${botName}`);

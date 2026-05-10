@@ -5,10 +5,15 @@
 # ── Public interface (called by daemon.sh) ──
 
 supervisor_start() {
+  local entry="$SKILL_DIR/dist/daemon.mjs"
+  # Use orchestrator if bots.json exists
+  if [ -f "$CTI_HOME/bots.json" ]; then
+    entry="$SKILL_DIR/dist/orchestrator.mjs"
+  fi
   if command -v setsid >/dev/null 2>&1; then
-    setsid node "$SKILL_DIR/dist/daemon.mjs" >> "$LOG_FILE" 2>&1 < /dev/null &
+    setsid node "$entry" >> "$LOG_FILE" 2>&1 < /dev/null &
   else
-    nohup node "$SKILL_DIR/dist/daemon.mjs" >> "$LOG_FILE" 2>&1 < /dev/null &
+    nohup node "$entry" >> "$LOG_FILE" 2>&1 < /dev/null &
   fi
   # Fallback: write shell $! as PID; main.ts will overwrite with real PID
   echo $! > "$PID_FILE"
