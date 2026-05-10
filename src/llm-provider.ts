@@ -49,6 +49,15 @@ function loadMcpServers(): Record<string, unknown> | undefined {
       }
     } catch { /* .claude.json may not exist */ }
 
+    // Normalize: if a server has `url` but no `type`, infer transport type
+    // The CLI accepts { type: 'sse', url: '...' } format for SSE MCP servers
+    for (const [name, cfg] of Object.entries(active)) {
+      if (cfg && typeof cfg === 'object' && 'url' in cfg && !('type' in cfg) && !('command' in cfg)) {
+        const url = (cfg as Record<string, unknown>).url as string;
+        (cfg as Record<string, string>).type = url.endsWith('/sse') ? 'sse' : 'http';
+      }
+    }
+
     const result = Object.keys(active).length > 0 ? active : undefined;
     _mcpCache = { value: result, ts: Date.now() };
     return result;

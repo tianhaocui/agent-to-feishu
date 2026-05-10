@@ -25,6 +25,8 @@ import type {
 } from '../types.js';
 import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter.js';
 import { getBridgeContext } from '../context.js';
+import { splitByMentions, escapeRegex } from '../mention-utils.js';
+import type { MentionSegment } from '../mention-utils.js';
 import {
   htmlToFeishuMarkdown,
   preprocessFeishuMarkdown,
@@ -114,41 +116,7 @@ interface StreamingCardState {
   guard: import('../unavailable-guard.js').UnavailableGuard | null;
 }
 
-/** Escape a string for use in a RegExp. */
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// ── @mention segment splitting for multi-bot relay ──
-
-interface MentionSegment { targetBot: string | null; text: string; }
-
-function splitByMentions(text: string, knownBots: Set<string>): MentionSegment[] {
-  const paragraphs = text.split(/\n\n+/);
-  const segments: MentionSegment[] = [];
-  let current: MentionSegment = { targetBot: null, text: '' };
-  for (const para of paragraphs) {
-    const bracketMatch = para.match(/^@\[([^\]]+)\]/);
-    let mentionedBot = bracketMatch?.[1] || null;
-    if (!mentionedBot) {
-      for (const name of knownBots) {
-        const re = new RegExp(`^@${escapeRegex(name)}(?![\\w])`);
-        if (re.test(para)) { mentionedBot = name; break; }
-      }
-    }
-    if (mentionedBot && knownBots.has(mentionedBot)) {
-      if (current.text.trim()) segments.push(current);
-      current = { targetBot: mentionedBot, text: para };
-    } else if (current.targetBot !== null) {
-      segments.push(current);
-      current = { targetBot: null, text: para };
-    } else {
-      current.text += (current.text ? '\n\n' : '') + para;
-    }
-  }
-  if (current.text.trim()) segments.push(current);
-  return segments;
-}
+// splitByMentions imported from ../mention-utils.js
 
 /** Abort text patterns for fast-path detection. */
 const ABORT_PATTERNS = /^(\/stop|stop|停止|取消|abort|cancel)$/i;
@@ -1156,13 +1124,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string, meta?: import('../channel-adapter.js').StreamEndMeta): Promise<boolean> {
-    // Check if streaming card-split was active (set by bridge-manager)
-    const splitInfo = (this as any)._streamSplitActive as { chatId: string; relayed: { targetBot: string; text: string }[]; splitOffset: number } | undefined;
-    delete (this as any)._streamSplitActive;
+    const splitInfo = meta?.splitRelay;
 
     const cardMessageId = this.activeCards.get(chatId)?.messageId || undefined;
 
-    if (splitInfo && splitInfo.chatId === chatId && status === 'completed' && responseText) {
+    if (splitInfo && status === 'completed' && responseText) {
       // Card-split path: finalize last card with only the last segment's text
       const { relayToBot, getRelayPeerNames } = await import('../bridge-manager.js');
       const allBots = new Set([...this.knownBots.keys(), ...getRelayPeerNames()]);

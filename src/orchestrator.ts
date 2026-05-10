@@ -68,6 +68,27 @@ function writeStatus(info: Record<string, unknown>): void {
 
 const workers = new Map<string, Worker>();
 const workerEntryPath = path.join(__dirname, 'worker-entry.mjs');
+const restartState = new Map<string, { failures: number; lastExit: number }>();
+
+function getBackoffMs(botKey: string): number {
+  const state = restartState.get(botKey);
+  if (!state) return 3000;
+  const delay = Math.min(3000 * Math.pow(2, state.failures - 1), 60000);
+  return delay;
+}
+
+function recordExit(botKey: string): void {
+  const now = Date.now();
+  const state = restartState.get(botKey) || { failures: 0, lastExit: 0 };
+  // Reset failure count if last exit was more than 5 minutes ago (healthy run)
+  if (now - state.lastExit > 300_000) {
+    state.failures = 1;
+  } else {
+    state.failures++;
+  }
+  state.lastExit = now;
+  restartState.set(botKey, state);
+}
 
 function spawnWorker(bot: BotEntry): Worker {
   const w = new Worker(workerEntryPath, {
@@ -99,13 +120,16 @@ function spawnWorker(bot: BotEntry): Worker {
     console.warn(`[orchestrator] Worker ${bot.name} exited (code: ${code})`);
     workers.delete(bot.name.toLowerCase());
     if (!shuttingDown) {
-      console.log(`[orchestrator] Restarting ${bot.name} in 3s...`);
+      const botKey = bot.name.toLowerCase();
+      recordExit(botKey);
+      const delay = getBackoffMs(botKey);
+      console.log(`[orchestrator] Restarting ${bot.name} in ${delay}ms...`);
       setTimeout(() => {
         if (!shuttingDown) {
           const newWorker = spawnWorker(bot);
-          workers.set(bot.name.toLowerCase(), newWorker);
+          workers.set(botKey, newWorker);
         }
-      }, 3000);
+      }, delay);
     }
   });
 

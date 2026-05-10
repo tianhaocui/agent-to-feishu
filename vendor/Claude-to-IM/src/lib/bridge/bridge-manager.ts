@@ -17,6 +17,8 @@ import * as engine from './conversation-engine.js';
 import * as broker from './permission-broker.js';
 import { deliver } from './delivery-layer.js';
 import { getBridgeContext } from './context.js';
+import { splitByMentions } from './mention-utils.js';
+import type { MentionSegment } from './mention-utils.js';
 import { escapeHtml } from './html-utils.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -58,36 +60,7 @@ function getStreamConfig(channelType = 'feishu'): StreamConfig {
   return { intervalMs, minDeltaChars, maxChars };
 }
 
-// ── @mention segment splitting for multi-bot card relay ──
-
-interface MentionSegment { targetBot: string | null; text: string; }
-
-function splitByMentionsBM(text: string, knownBots: Set<string>): MentionSegment[] {
-  const paragraphs = text.split(/\n\n+/);
-  const segments: MentionSegment[] = [];
-  let current: MentionSegment = { targetBot: null, text: '' };
-  for (const para of paragraphs) {
-    const bracketMatch = para.match(/^@\[([^\]]+)\]/);
-    let mentionedBot = bracketMatch?.[1] || null;
-    if (!mentionedBot) {
-      for (const name of knownBots) {
-        const re = new RegExp(`^@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w])`);
-        if (re.test(para)) { mentionedBot = name; break; }
-      }
-    }
-    if (mentionedBot && knownBots.has(mentionedBot)) {
-      if (current.text.trim()) segments.push(current);
-      current = { targetBot: mentionedBot, text: para };
-    } else if (current.targetBot !== null) {
-      segments.push(current);
-      current = { targetBot: null, text: para };
-    } else {
-      current.text += (current.text ? '\n\n' : '') + para;
-    }
-  }
-  if (current.text.trim()) segments.push(current);
-  return segments;
-}
+// splitByMentions imported from ./mention-utils.js
 
 /**
  * Check if a message looks like a numeric permission shortcut (1/2/3) for
@@ -913,6 +886,7 @@ async function processRegularMessage(
     splitOffset: 0,
     splitCount: 0,
     relayedSegments: [] as { targetBot: string; text: string }[],
+    splitQueue: Promise.resolve() as Promise<void>,
   } : null;
 
   // Combined partial text callback: streaming preview + streaming cards + mention split
@@ -928,7 +902,7 @@ async function processRegularMessage(
         ...getRelayPeerNames(),
       ]);
       if (allBots.size > 0) {
-        const allSegments = splitByMentionsBM(textOnly, allBots);
+        const allSegments = splitByMentions(textOnly, allBots);
         const mentionIndices = allSegments
           .map((s, i) => s.targetBot !== null ? i : -1)
           .filter(i => i >= 0);
@@ -943,10 +917,12 @@ async function processRegularMessage(
             mentionTracker.splitOffset = upToHere.length + 2;
 
             const myName = adapter.botName || 'unknown';
-            (adapter as any).splitStreamingCard?.(msg.address.chatId, seg.text)
-              .then((cardMsgId: string | undefined) => {
-                relayToBot(seg.targetBot!, msg.address.chatId, seg.text, myName, cardMsgId).catch(() => {});
-              }).catch(() => {});
+            mentionTracker.splitQueue = mentionTracker.splitQueue.then(async () => {
+              try {
+                const cardMsgId = await (adapter as any).splitStreamingCard?.(msg.address.chatId, seg.text);
+                await relayToBot(seg.targetBot!, msg.address.chatId, seg.text, myName, cardMsgId);
+              } catch { /* logged elsewhere */ }
+            });
             console.log(`[bridge-manager] Card-split: finalized card for @${seg.targetBot} (${seg.text.length} chars)`);
           }
         }
@@ -1125,14 +1101,6 @@ async function processRegularMessage(
     // was actually finalized (meaning content is already visible to the user).
     let cardFinalized = false;
     if (hasStreamingCards && adapter.onStreamEnd) {
-      // Pass split info so adapter knows which segments were already relayed
-      if (mentionTracker && mentionTracker.relayedSegments.length > 0) {
-        (adapter as any)._streamSplitActive = {
-          chatId: msg.address.chatId,
-          relayed: mentionTracker.relayedSegments,
-          splitOffset: mentionTracker.splitOffset,
-        };
-      }
       const meta = {
         tokenUsage: result.tokenUsage ? {
           input: result.tokenUsage.input_tokens ?? 0,
@@ -1141,6 +1109,9 @@ async function processRegularMessage(
           cacheCreation: result.tokenUsage.cache_creation_input_tokens ?? undefined,
         } : undefined,
         model: result.model || undefined,
+        splitRelay: (mentionTracker && mentionTracker.relayedSegments.length > 0)
+          ? { relayed: mentionTracker.relayedSegments, splitOffset: mentionTracker.splitOffset }
+          : undefined,
       };
       try {
         const status = result.hasError ? 'error' : 'completed';
