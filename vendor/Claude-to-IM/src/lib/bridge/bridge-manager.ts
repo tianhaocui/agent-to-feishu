@@ -17,6 +17,8 @@ import * as engine from './conversation-engine.js';
 import * as broker from './permission-broker.js';
 import { deliver } from './delivery-layer.js';
 import { getBridgeContext } from './context.js';
+import { splitByMentions, MentionMatcher } from './mention-utils.js';
+import type { MentionSegment } from './mention-utils.js';
 import { escapeHtml } from './html-utils.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -57,6 +59,7 @@ function getStreamConfig(channelType = 'feishu'): StreamConfig {
   const maxChars = parseInt(store.getSetting(`${prefix}max_chars`) || '', 10) || defaults.maxChars;
   return { intervalMs, minDeltaChars, maxChars };
 }
+
 
 /**
  * Check if a message looks like a numeric permission shortcut (1/2/3) for
@@ -464,27 +467,22 @@ async function handleMessage(
       const answers: Record<string, string> = {};
       for (let i = 0; i < questions.length; i++) {
         const q = questions[i];
-        const rawValue = msg.formValue[`q_${i}`];
-        if (rawValue === undefined || rawValue === null) continue;
-
-        // Check if user typed a custom answer (takes priority over dropdown)
-        const customKey = `q_${i}_custom`;
-        const customValue = msg.formValue[customKey];
+        const customValue = msg.formValue[`q_${i}_custom`];
         if (typeof customValue === 'string' && customValue.trim()) {
           answers[q.question] = customValue.trim();
           continue;
         }
 
+        const rawValue = msg.formValue[`q_${i}`];
+        if (rawValue === undefined || rawValue === null) continue;
+
         if (q.multiSelect && Array.isArray(rawValue)) {
-          // Multi-select: values are "opt_N_label", extract labels
           const labels = rawValue.map((v: string) => v.replace(/^opt_\d+_/, ''));
           answers[q.question] = labels.join(', ');
         } else if (typeof rawValue === 'string') {
           if (rawValue.startsWith('opt_')) {
-            // Single-select: "opt_N_label"
             answers[q.question] = rawValue.replace(/^opt_\d+_/, '');
           } else {
-            // Free-text input
             answers[q.question] = rawValue;
           }
         }
@@ -852,8 +850,8 @@ async function processRegularMessage(
   const hasStreamingCards = typeof adapter.onStreamText === 'function';
   const toolCallTracker = new Map<string, ToolCallInfo>();
 
-  const onStreamCardText = hasStreamingCards ? (fullText: string) => {
-    try { adapter.onStreamText!(msg.address.chatId, fullText); } catch { /* non-critical */ }
+  const onStreamCardText = hasStreamingCards ? (cardText: string) => {
+    try { adapter.onStreamText!(msg.address.chatId, cardText); } catch { /* non-critical */ }
   } : undefined;
 
   const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => {
@@ -875,10 +873,84 @@ async function processRegularMessage(
     } catch { /* non-critical */ }
   } : undefined;
 
-  // Combined partial text callback: streaming preview + streaming cards
-  const onPartialText = (previewOnPartialText || onStreamCardText) ? (fullText: string) => {
+  // ── Streaming card-split tracker (multi-bot @mention) ──
+  const multiBotSplit = msg.isGroup && store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
+  const mentionTracker = multiBotSplit ? {
+    lastText: '',
+    splitOffset: 0,
+    splitCount: 0,
+    relayedSegments: [] as { targetBot: string; text: string }[],
+    splitQueue: Promise.resolve() as Promise<void>,
+    splitting: false,
+    cachedMatcher: null as MentionMatcher | null,
+    cachedBotSetKey: '',
+  } : null;
+
+  // Combined partial text callback: streaming preview + streaming cards + mention split
+  const onPartialText = (previewOnPartialText || onStreamCardText || mentionTracker) ? (fullText: string) => {
+    if (taskAbort.signal.aborted) return;
+
     if (previewOnPartialText) previewOnPartialText(fullText);
-    if (onStreamCardText) onStreamCardText(fullText);
+
+    const textOnly = fullText.replace(/^<think>[\s\S]*?<\/think>\s*/, '');
+
+    if (mentionTracker && textOnly.length > mentionTracker.lastText.length) {
+      mentionTracker.lastText = textOnly;
+      const allBots = new Set([
+        ...((adapter as any).knownBotNames?.() || []),
+        ...getRelayPeerNames(),
+      ]);
+      if (allBots.size > 0) {
+        const botSetKey = [...allBots].sort().join('\0');
+        if (botSetKey !== mentionTracker.cachedBotSetKey) {
+          mentionTracker.cachedMatcher = new MentionMatcher(allBots);
+          mentionTracker.cachedBotSetKey = botSetKey;
+        }
+        const allSegments = mentionTracker.cachedMatcher!.split(textOnly);
+        const mentionIndices = allSegments
+          .map((s, i) => s.targetBot !== null ? i : -1)
+          .filter(i => i >= 0);
+
+        for (let mi = mentionTracker.splitCount; mi < mentionIndices.length; mi++) {
+          const idx = mentionIndices[mi];
+          if (idx < allSegments.length - 1) {
+            const seg = allSegments[idx];
+            mentionTracker.splitCount++;
+            mentionTracker.relayedSegments.push({ targetBot: seg.targetBot!, text: seg.text });
+
+            // Cumulative offset: sum lengths of segments up to and including this one
+            let cumOffset = 0;
+            for (let si = 0; si <= idx; si++) {
+              if (si > 0) cumOffset += 2; // \n\n separator
+              cumOffset += allSegments[si].text.length;
+            }
+            // Skip trailing newlines in original text after this segment
+            const afterCum = textOnly.slice(cumOffset);
+            const trailingNl = afterCum.match(/^\n+/);
+            mentionTracker.splitOffset = cumOffset + (trailingNl?.[0].length || 2);
+
+            // Only split the card visually; relay is deferred to onStreamEnd
+            // so the target bot receives the complete final text.
+            mentionTracker.splitting = true;
+            mentionTracker.splitQueue = mentionTracker.splitQueue.then(async () => {
+              try {
+                await (adapter as any).splitStreamingCard?.(msg.address.chatId, seg.text);
+              } catch { /* logged elsewhere */ }
+            }).finally(() => { mentionTracker.splitting = false; });
+            console.log(`[bridge-manager] Card-split: finalized card for @${seg.targetBot} (${seg.text.length} chars)`);
+          }
+        }
+      }
+    }
+
+    // Suppress card updates while a split operation is in progress
+    if (mentionTracker?.splitting) return;
+
+    // Pass only current segment text to card (after split offset)
+    const cardText = mentionTracker && mentionTracker.splitOffset > 0
+      ? textOnly.slice(mentionTracker.splitOffset)
+      : fullText;
+    if (onStreamCardText) onStreamCardText(cardText);
   } : undefined;
 
   try {
@@ -1054,6 +1126,9 @@ async function processRegularMessage(
           cacheCreation: result.tokenUsage.cache_creation_input_tokens ?? undefined,
         } : undefined,
         model: result.model || undefined,
+        splitRelay: (mentionTracker && mentionTracker.relayedSegments.length > 0)
+          ? { relayed: mentionTracker.relayedSegments, splitOffset: mentionTracker.splitOffset }
+          : undefined,
       };
       try {
         const status = result.hasError ? 'error' : 'completed';
@@ -1448,6 +1523,17 @@ async function handleCommand(
       break;
     }
 
+    case '/compact': {
+      const binding = router.resolve(msg.address);
+      if (!binding.sdkSessionId) {
+        response = 'No active session to compact.';
+        break;
+      }
+      router.updateBinding(binding.id, { sdkSessionId: '' });
+      response = 'Session context cleared. Next message starts a fresh session.';
+      break;
+    }
+
     case '/perm': {
       // Text-based permission approval fallback (for channels without inline buttons)
       // Usage: /perm allow <id> | /perm allow_session <id> | /perm deny <id>
@@ -1508,6 +1594,7 @@ async function handleCommand(
         '/sessions - List recent sessions',
         '/resume [n] - Resume a previous session',
         '/stop - Stop current session',
+        '/compact - Clear session context',
         '/think low|medium|high|max|off - Set thinking effort',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
         '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
@@ -1568,14 +1655,19 @@ export function computeSdkSessionUpdate(
   hasError: boolean,
   errorMessage?: string,
 ): string | null {
+  // Unrecoverable errors: force-clear session even if SDK returned a session ID.
+  // These errors mean the session transcript is too large to ever resume.
+  if (hasError && errorMessage && /too large|32MB|Request.*large/i.test(errorMessage)) {
+    return '';
+  }
   if (sdkSessionId) {
     return sdkSessionId;
   }
   if (hasError) {
-    if (errorMessage && isSessionInvalidatingError(errorMessage)) {
-      return '';
-    }
-    return null;
+    // Clear session on any error to prevent infinite retry loops.
+    // Even for transient errors (rate limit, timeout), starting a fresh
+    // session is safer than repeatedly resuming a potentially broken one.
+    return '';
   }
   return null;
 }
@@ -1583,8 +1675,27 @@ export function computeSdkSessionUpdate(
 // ── Relay Server for Multi-Bot Communication ────────────────
 
 import http from 'node:http';
+import { parentPort, isMainThread } from 'node:worker_threads';
 
 let relayServer: http.Server | null = null;
+
+// Pending relay ack/nack tracking for Worker thread mode
+const pendingRelays = new Map<string, { resolve: (ok: boolean) => void; timer: ReturnType<typeof setTimeout> }>();
+
+if (!isMainThread && parentPort) {
+  parentPort.on('message', (msg: any) => {
+    if (msg.type === 'relay-ack' || msg.type === 'relay-nack') {
+      const pending = pendingRelays.get(msg.correlationId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pendingRelays.delete(msg.correlationId);
+        pending.resolve(msg.type === 'relay-ack');
+      } else {
+        console.warn(`[relay] Late ${msg.type} for ${msg.correlationId} (already timed out)`);
+      }
+    }
+  });
+}
 
 /** Parsed relay peers: name (lowercase) -> { host, port } */
 const relayPeers = new Map<string, { host: string; port: number }>();
@@ -1646,14 +1757,27 @@ export function startRelayServer(): void {
           const identity = JSON.parse(text);
           if (identity.type === 'identity' && identity.name && identity.openId) {
             const state = getState();
+            let myName: string | null = null;
+            let myOpenId: string | null = null;
             for (const [, adapter] of state.adapters) {
               if ('registerPeerBot' in adapter && typeof (adapter as any).registerPeerBot === 'function') {
                 (adapter as any).registerPeerBot(identity.name, identity.openId);
+                if (!myName && (adapter as any).botName) {
+                  myName = (adapter as any).botName;
+                  myOpenId = (adapter as any).botOpenId;
+                }
               }
             }
             console.log(`[relay-server] Registered peer identity: ${identity.name} -> ${identity.openId}`);
-            res.writeHead(200);
-            res.end('OK');
+
+            // Reply with our own identity so the sender can register us
+            if (myName && myOpenId) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ type: 'identity', name: myName, openId: myOpenId }));
+            } else {
+              res.writeHead(200);
+              res.end('OK');
+            }
             return;
           }
         } catch { /* fall through to normal relay */ }
@@ -1727,6 +1851,25 @@ export function getRelayPeerNames(): string[] {
  * Returns true if the message was sent successfully.
  */
 export async function relayToBot(botName: string, chatId: string, text: string, senderName: string, replyMessageId?: string): Promise<boolean> {
+  // Worker thread mode: relay via parentPort to orchestrator with ack/nack
+  if (!isMainThread && parentPort) {
+    const correlationId = `relay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        pendingRelays.delete(correlationId);
+        console.warn(`[relay] Timeout waiting for ack: ${botName}`);
+        resolve(false);
+      }, 10_000);
+      pendingRelays.set(correlationId, { resolve, timer });
+      parentPort!.postMessage({
+        type: 'relay',
+        target: botName.toLowerCase(),
+        correlationId,
+        payload: { chatId, text, senderName, senderType: 'bot', replyMessageId },
+      });
+    });
+  }
+
   const peer = relayPeers.get(botName.toLowerCase());
   if (!peer) {
     console.warn(`[relay-server] Unknown peer bot: ${botName}`);

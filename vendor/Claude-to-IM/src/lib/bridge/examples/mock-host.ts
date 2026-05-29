@@ -105,6 +105,7 @@ class InMemoryStore implements BridgeStore {
   insertPermissionLink() {}
   getPermissionLink() { return null; }
   markPermissionLinkResolved() { return false; }
+  updatePermissionLinkMessageId() {}
   listPendingPermissionLinksByChat() { return []; }
   getChannelOffset() { return '0'; }
   setChannelOffset() {}

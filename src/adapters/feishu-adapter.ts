@@ -40,6 +40,8 @@ export class FeishuPairingAdapter extends BaseChannelAdapter {
 
   async start(): Promise<void> {
     await this.inner.start();
+    // Sync own property to shadow the base-class field (class fields override prototype getters)
+    (this as any).botName = this.inner.botName;
   }
 
   async stop(): Promise<void> {

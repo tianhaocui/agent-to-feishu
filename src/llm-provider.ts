@@ -49,6 +49,13 @@ function loadMcpServers(): Record<string, unknown> | undefined {
       }
     } catch { /* .claude.json may not exist */ }
 
+    // Normalize: if a server has `url` but no `type`, default to sse transport
+    for (const [name, cfg] of Object.entries(active)) {
+      if (cfg && typeof cfg === 'object' && 'url' in cfg && !('type' in cfg) && !('command' in cfg)) {
+        (cfg as Record<string, string>).type = 'sse';
+      }
+    }
+
     const result = Object.keys(active).length > 0 ? active : undefined;
     _mcpCache = { value: result, ts: Date.now() };
     return result;
@@ -623,7 +630,9 @@ export class SDKLLMProvider implements LLMProvider {
 
                     const result = await pendingPerms.waitFor(opts.toolUseID);
                     if (result.behavior === 'allow') {
-                      return { behavior: 'allow' as const, updatedInput: result.updatedInput || input };
+                      // Merge answers into the original input (which has questions)
+                      const merged = { ...input, ...result.updatedInput };
+                      return { behavior: 'allow' as const, updatedInput: merged };
                     }
                     return { behavior: 'deny' as const, message: result.message || 'Denied by user' };
                   }
@@ -860,13 +869,17 @@ export function handleMessage(
             },
           }),
         );
+        if (msg.is_error && !state.hasStreamedText) {
+          const errorDetail = (msg as any).result || 'Claude Code encountered an error';
+          controller.enqueue(sseEvent('error', errorDetail));
+        }
       } else {
         // Error result from SDK (distinct from transport errors in catch)
         const errors =
           'errors' in msg && Array.isArray(msg.errors)
             ? msg.errors.join('; ')
             : 'Unknown error';
-        controller.enqueue(sseEvent('error', errors));
+        controller.enqueue(sseEvent('error', errors || 'Unknown error'));
       }
       break;
     }
