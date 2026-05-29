@@ -888,6 +888,8 @@ async function processRegularMessage(
 
   // Combined partial text callback: streaming preview + streaming cards + mention split
   const onPartialText = (previewOnPartialText || onStreamCardText || mentionTracker) ? (fullText: string) => {
+    if (taskAbort.signal.aborted) return;
+
     if (previewOnPartialText) previewOnPartialText(fullText);
 
     const textOnly = fullText.replace(/^<think>[\s\S]*?<\/think>\s*/, '');
@@ -927,12 +929,12 @@ async function processRegularMessage(
             const trailingNl = afterCum.match(/^\n+/);
             mentionTracker.splitOffset = cumOffset + (trailingNl?.[0].length || 2);
 
+            // Only split the card visually; relay is deferred to onStreamEnd
+            // so the target bot receives the complete final text.
             mentionTracker.splitting = true;
-            const myName = adapter.botName || 'unknown';
             mentionTracker.splitQueue = mentionTracker.splitQueue.then(async () => {
               try {
-                const cardMsgId = await (adapter as any).splitStreamingCard?.(msg.address.chatId, seg.text);
-                await relayToBot(seg.targetBot!, msg.address.chatId, seg.text, myName, cardMsgId);
+                await (adapter as any).splitStreamingCard?.(msg.address.chatId, seg.text);
               } catch { /* logged elsewhere */ }
             }).finally(() => { mentionTracker.splitting = false; });
             console.log(`[bridge-manager] Card-split: finalized card for @${seg.targetBot} (${seg.text.length} chars)`);
@@ -1521,6 +1523,17 @@ async function handleCommand(
       break;
     }
 
+    case '/compact': {
+      const binding = router.resolve(msg.address);
+      if (!binding.sdkSessionId) {
+        response = 'No active session to compact.';
+        break;
+      }
+      router.updateBinding(binding.id, { sdkSessionId: '' });
+      response = 'Session context cleared. Next message starts a fresh session.';
+      break;
+    }
+
     case '/perm': {
       // Text-based permission approval fallback (for channels without inline buttons)
       // Usage: /perm allow <id> | /perm allow_session <id> | /perm deny <id>
@@ -1581,6 +1594,7 @@ async function handleCommand(
         '/sessions - List recent sessions',
         '/resume [n] - Resume a previous session',
         '/stop - Stop current session',
+        '/compact - Clear session context',
         '/think low|medium|high|max|off - Set thinking effort',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
         '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
@@ -1641,14 +1655,19 @@ export function computeSdkSessionUpdate(
   hasError: boolean,
   errorMessage?: string,
 ): string | null {
+  // Unrecoverable errors: force-clear session even if SDK returned a session ID.
+  // These errors mean the session transcript is too large to ever resume.
+  if (hasError && errorMessage && /too large|32MB|Request.*large/i.test(errorMessage)) {
+    return '';
+  }
   if (sdkSessionId) {
     return sdkSessionId;
   }
   if (hasError) {
-    if (errorMessage && isSessionInvalidatingError(errorMessage)) {
-      return '';
-    }
-    return null;
+    // Clear session on any error to prevent infinite retry loops.
+    // Even for transient errors (rate limit, timeout), starting a fresh
+    // session is safer than repeatedly resuming a potentially broken one.
+    return '';
   }
   return null;
 }
@@ -1738,14 +1757,27 @@ export function startRelayServer(): void {
           const identity = JSON.parse(text);
           if (identity.type === 'identity' && identity.name && identity.openId) {
             const state = getState();
+            let myName: string | null = null;
+            let myOpenId: string | null = null;
             for (const [, adapter] of state.adapters) {
               if ('registerPeerBot' in adapter && typeof (adapter as any).registerPeerBot === 'function') {
                 (adapter as any).registerPeerBot(identity.name, identity.openId);
+                if (!myName && (adapter as any).botName) {
+                  myName = (adapter as any).botName;
+                  myOpenId = (adapter as any).botOpenId;
+                }
               }
             }
             console.log(`[relay-server] Registered peer identity: ${identity.name} -> ${identity.openId}`);
-            res.writeHead(200);
-            res.end('OK');
+
+            // Reply with our own identity so the sender can register us
+            if (myName && myOpenId) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ type: 'identity', name: myName, openId: myOpenId }));
+            } else {
+              res.writeHead(200);
+              res.end('OK');
+            }
             return;
           }
         } catch { /* fall through to normal relay */ }

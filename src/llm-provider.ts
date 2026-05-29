@@ -869,13 +869,17 @@ export function handleMessage(
             },
           }),
         );
+        if (msg.is_error && !state.hasStreamedText) {
+          const errorDetail = (msg as any).result || 'Claude Code encountered an error';
+          controller.enqueue(sseEvent('error', errorDetail));
+        }
       } else {
         // Error result from SDK (distinct from transport errors in catch)
         const errors =
           'errors' in msg && Array.isArray(msg.errors)
             ? msg.errors.join('; ')
             : 'Unknown error';
-        controller.enqueue(sseEvent('error', errors));
+        controller.enqueue(sseEvent('error', errors || 'Unknown error'));
       }
       break;
     }

@@ -459,6 +459,14 @@ export class JsonFileStore implements BridgeStore {
     return true;
   }
 
+  updatePermissionLinkMessageId(permissionRequestId: string, messageId: string): void {
+    const link = this.permissionLinks.get(permissionRequestId);
+    if (link) {
+      link.messageId = messageId;
+      this.persistPermissions();
+    }
+  }
+
   listPendingPermissionLinksByChat(chatId: string): PermissionLinkRecord[] {
     const result: PermissionLinkRecord[] = [];
     for (const link of this.permissionLinks.values()) {

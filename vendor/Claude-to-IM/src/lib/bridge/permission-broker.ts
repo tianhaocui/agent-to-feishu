@@ -80,19 +80,26 @@ export async function forwardPermissionRequest(
     replyToMessageId,
   };
 
+  // Pre-register the link BEFORE sending the card so that fast button clicks
+  // (arriving before the deliver() HTTP response) can still be resolved.
+  // Use a placeholder messageId; update it after delivery succeeds.
+  try {
+    store.insertPermissionLink({
+      permissionRequestId,
+      channelType: adapter.channelType,
+      chatId: address.chatId,
+      messageId: '__pending__',
+      toolName,
+      suggestions: suggestions ? JSON.stringify(suggestions) : '',
+    });
+  } catch { /* best effort */ }
+
   const result = await deliver(adapter, message, { sessionId });
 
-  // Record the link so we can match callback queries back to this permission
+  // Update the link with the real messageId (or remove if delivery failed)
   if (result.ok && result.messageId) {
     try {
-      store.insertPermissionLink({
-        permissionRequestId,
-        channelType: adapter.channelType,
-        chatId: address.chatId,
-        messageId: result.messageId,
-        toolName,
-        suggestions: suggestions ? JSON.stringify(suggestions) : '',
-      });
+      store.updatePermissionLinkMessageId(permissionRequestId, result.messageId);
     } catch { /* best effort */ }
   }
 }
@@ -134,7 +141,8 @@ export function handlePermissionCallback(
   }
 
   // Security: verify the callback came from the original permission message
-  if (callbackMessageId && link.messageId !== callbackMessageId) {
+  // Skip check if link.messageId is still pending (card was clicked before deliver() returned)
+  if (callbackMessageId && link.messageId !== '__pending__' && link.messageId !== callbackMessageId) {
     console.warn(`[permission-broker] Message ID mismatch: expected ${link.messageId}, got ${callbackMessageId}`);
     return false;
   }

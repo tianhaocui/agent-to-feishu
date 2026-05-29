@@ -28,10 +28,8 @@ export function splitByMentions(text: string, knownBots: Set<string>): MentionSe
     if (mentionedBot && knownBots.has(mentionedBot)) {
       if (current.text.trim()) segments.push(current);
       current = { targetBot: mentionedBot, text: para };
-    } else if (current.targetBot !== null) {
-      segments.push(current);
-      current = { targetBot: null, text: para };
     } else {
+      // Continue appending to current segment (whether it has a targetBot or not)
       current.text += (current.text ? '\n\n' : '') + para;
     }
   }
@@ -75,10 +73,8 @@ export class MentionMatcher {
       if (mentionedBot) {
         if (current.text.trim()) segments.push(current);
         current = { targetBot: mentionedBot, text: para };
-      } else if (current.targetBot !== null) {
-        segments.push(current);
-        current = { targetBot: null, text: para };
       } else {
+        // Continue appending to current segment (whether it has a targetBot or not)
         current.text += (current.text ? '\n\n' : '') + para;
       }
     }

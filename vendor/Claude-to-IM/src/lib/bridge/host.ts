@@ -195,6 +195,7 @@ export interface BridgeStore {
   insertPermissionLink(link: PermissionLinkInput): void;
   getPermissionLink(permissionRequestId: string): PermissionLinkRecord | null;
   markPermissionLinkResolved(permissionRequestId: string): boolean;
+  updatePermissionLinkMessageId(permissionRequestId: string, messageId: string): void;
   /** List unresolved permission links for a given chat. */
   listPendingPermissionLinksByChat(chatId: string): PermissionLinkRecord[];
 

@@ -161,6 +161,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
   readonly channelType: ChannelType = 'feishu';
 
   private running = false;
+  private adapterStartedAt = 0;
+  private recentMessageIds = new Set<string>();
+  private recentMessageIdsTimer: ReturnType<typeof setInterval> | null = null;
+  private identityExchangeTimer: ReturnType<typeof setInterval> | null = null;
   private queue: InboundMessage[] = [];
   private waiters: Array<(msg: InboundMessage | null) => void> = [];
   private wsClient: lark.WSClient | null = null;
@@ -226,11 +230,34 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.loadKnownBots();
 
     this.running = true;
+    this.adapterStartedAt = Date.now();
+
+    // Periodically trim the raw dedup Set (keep last 10 minutes of IDs)
+    this.recentMessageIdsTimer = setInterval(() => {
+      if (this.recentMessageIds.size > 2000) {
+        this.recentMessageIds.clear();
+      }
+    }, 10 * 60 * 1000);
 
     // Create EventDispatcher and register event handlers.
+    // IMPORTANT: Do NOT await handleIncomingEvent — returning immediately lets the SDK
+    // send the ACK frame to Feishu before processing completes. If we await (blocking
+    // for 15-60s of LLM work), Feishu re-delivers the message causing duplicate replies.
     const dispatcher = new lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (data) => {
-        await this.handleIncomingEvent(data as FeishuMessageEventData);
+        const msgId = (data as any)?.message?.message_id;
+        if (msgId) {
+          const now = Date.now();
+          const prev = this.earlyDedup.get(msgId);
+          if (prev && now - prev < 60_000) {
+            console.log(`[feishu-adapter] DEDUP-GATE blocked: msgId=${msgId} (gap=${now - prev}ms)`);
+            return;
+          }
+          this.earlyDedup.set(msgId, now);
+        }
+        this.handleIncomingEvent(data as FeishuMessageEventData).catch((err) => {
+          console.error('[feishu-adapter] Unhandled error in fire-and-forget handler:', err);
+        });
       },
       'card.action.trigger': (async (data: unknown) => {
         return await this.handleCardAction(data);
@@ -280,6 +307,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // with those p2p conversations.
     this.warmP2pChannels().catch(() => {});
     this.discoverPeerBotsFromGroups().catch(() => {});
+
+    // Periodic identity exchange: retry until all relay peers are registered
+    this.identityExchangeTimer = setInterval(() => {
+      this.discoverPeerBotsFromGroups().catch(() => {});
+    }, 30_000);
   }
 
   /**
@@ -315,16 +347,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   /**
-   * Discover peer bots by scanning group member lists at startup.
-   * This ensures we know other bots' open_ids even if we never receive
-   * messages mentioning them (e.g. when the app only gets @-mentioned msgs).
+   * Discover peer bots by sending identity to relay peers.
+   * Called at startup and periodically until all peers are registered.
    */
   private async discoverPeerBotsFromGroups(): Promise<void> {
-    // Wait for relay server to start (it starts after adapter)
-    await new Promise(resolve => setTimeout(resolve, 3000));
-
     try {
       const { getRelayPeerNames, relayToBot } = await import('../bridge-manager.js');
+      const peerNames = getRelayPeerNames();
+      if (peerNames.length === 0 || !this.botOpenId || !this.botName) return;
 
       const myIdentity = JSON.stringify({
         type: 'identity',
@@ -332,27 +362,24 @@ export class FeishuAdapter extends BaseChannelAdapter {
         openId: this.botOpenId,
       });
 
-      // Retry up to 5 times with 3s intervals — peer bot may not be up yet
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const peerNames = getRelayPeerNames();
-        if (peerNames.length === 0 || !this.botOpenId || !this.botName) return;
-
-        let allSent = true;
-        for (const peerName of peerNames) {
-          if (this.knownBots.has(peerName.toLowerCase())) continue; // already known
-          try {
-            const sent = await relayToBot(peerName, '__identity__', myIdentity, this.botName || 'unknown');
-            if (sent) {
-              console.log(`[feishu-adapter] Sent identity to peer: ${peerName}`);
-            } else {
-              allSent = false;
-            }
-          } catch {
-            allSent = false;
-          }
+      // Send our identity to ALL peers (not just unknown ones).
+      // This ensures bidirectional registration: even if we already know peer B,
+      // B might not know us yet, so we keep announcing until everyone is registered.
+      let allKnown = true;
+      for (const peerName of peerNames) {
+        if (!this.knownBots.has(peerName.toLowerCase())) {
+          allKnown = false;
         }
-        if (allSent) break;
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        try {
+          await relayToBot(peerName, '__identity__', myIdentity, this.botName || 'unknown');
+        } catch { /* retry next interval */ }
+      }
+
+      // Stop periodic timer once all peers are registered on OUR side
+      if (allKnown && this.identityExchangeTimer) {
+        clearInterval(this.identityExchangeTimer);
+        this.identityExchangeTimer = null;
+        console.log(`[feishu-adapter] All relay peers registered, stopping identity exchange timer`);
       }
     } catch (err) {
       console.warn('[feishu-adapter] Peer identity exchange failed:', err instanceof Error ? err.message : err);
@@ -388,6 +415,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.cardCreatePromises.clear();
 
     this.seenMessageIds.clear();
+    this.recentMessageIds.clear();
+    if (this.recentMessageIdsTimer) { clearInterval(this.recentMessageIdsTimer); this.recentMessageIdsTimer = null; }
+    if (this.identityExchangeTimer) { clearInterval(this.identityExchangeTimer); this.identityExchangeTimer = null; }
     this.lastIncomingMessageId.clear();
     this.typingReactions.clear();
 
@@ -1071,17 +1101,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
    */
   onStreamText(chatId: string, fullText: string): void {
     if (!this.activeCards.has(chatId)) {
-      // Card should have been created by onMessageStart, but create lazily if not
-      const messageId = this.lastIncomingMessageId.get(chatId);
-      this.createStreamingCard(chatId, messageId).then((ok) => {
-        if (ok) this.updateCardContent(chatId, fullText);
-      }).catch(() => {});
       return;
     }
     this.updateCardContent(chatId, fullText);
   }
 
   onToolEvent(chatId: string, tools: ToolCallInfo[]): void {
+    if (!this.activeCards.has(chatId)) return;
     this.updateToolProgress(chatId, tools);
   }
 
@@ -1140,7 +1166,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const cardMessageId = this.activeCards.get(chatId)?.messageId || undefined;
 
     if (splitInfo && status === 'completed' && responseText) {
-      // Card-split path: finalize last card with only the last segment's text
+      // Card-split path: relay all bot segments with final complete text
       const { relayToBot, getRelayPeerNames } = await import('../bridge-manager.js');
       const allBots = new Set([...this.knownBots.keys(), ...getRelayPeerNames()]);
       const segments = splitByMentions(responseText, allBots);
@@ -1150,13 +1176,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const lastSegText = lastSeg?.text || responseText.slice(splitInfo.splitOffset);
       const result = await this.finalizeCard(chatId, status, lastSegText, meta);
 
-      if (lastSeg) {
-        const myName = this.knownBotsByOpenId.get(this.botOpenId || '') || 'unknown';
+      // Relay all bot segments with their final complete text
+      const myName = this.knownBotsByOpenId.get(this.botOpenId || '') || this.botName || 'unknown';
+      for (const seg of botSegments) {
         try {
-          await relayToBot(lastSeg.targetBot!, chatId, lastSeg.text, myName, cardMessageId);
-          console.log(`[feishu-adapter] Final split-relay to ${lastSeg.targetBot} (${lastSeg.text.length} chars)`);
+          await relayToBot(seg.targetBot!, chatId, seg.text, myName, cardMessageId);
+          console.log(`[feishu-adapter] Split-relay to ${seg.targetBot} (${seg.text.length} chars)`);
         } catch (err) {
-          console.warn(`[feishu-adapter] Final split-relay error:`, err);
+          console.warn(`[feishu-adapter] Split-relay error for ${seg.targetBot}:`, err);
         }
       }
       return result;
@@ -1187,7 +1214,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         }
       }
 
-      const myName = this.knownBotsByOpenId.get(this.botOpenId || '') || 'unknown';
+      const myName = this.knownBotsByOpenId.get(this.botOpenId || '') || this.botName || 'unknown';
 
       for (const botName of relayedBots) {
         try {
@@ -1539,7 +1566,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   // ── Incoming event handler ──────────────────────────────────
 
+  /** Ultra-early dedup gate: message_id -> timestamp. Checked before ANY processing. */
+  private earlyDedup = new Map<string, number>();
+
   private async handleIncomingEvent(data: FeishuMessageEventData): Promise<void> {
+    // Trim earlyDedup map periodically
+    if (this.earlyDedup.size > 5000) {
+      const cutoff = Date.now() - 60_000;
+      for (const [k, v] of this.earlyDedup) {
+        if (v < cutoff) this.earlyDedup.delete(k);
+      }
+    }
+
     try {
       await this.processIncomingEvent(data);
     } catch (err) {
@@ -1595,9 +1633,29 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return;
     }
 
-    // Dedup by message_id
-    if (this.seenMessageIds.has(msg.message_id)) return;
+    // Discard messages created before this adapter started (stale re-deliveries after restart)
+    if (msg.create_time && this.adapterStartedAt > 0) {
+      const msgCreatedAt = parseInt(msg.create_time, 10);
+      if (msgCreatedAt < this.adapterStartedAt - 5000) {
+        console.log(`[feishu-adapter] Discarding pre-start message, msgId: ${msg.message_id} (created ${this.adapterStartedAt - msgCreatedAt}ms before adapter start)`);
+        return;
+      }
+    }
+
+    // Dedup by message_id (triple-layer: LruCache + raw Set + persistent store)
+    if (this.seenMessageIds.has(msg.message_id) || this.recentMessageIds.has(msg.message_id)) {
+      console.log(`[feishu-adapter] DEDUP hit: msgId=${msg.message_id} (cache size=${this.seenMessageIds.size}, set size=${this.recentMessageIds.size})`);
+      return;
+    }
+    // Persistent dedup survives process restarts — catches Feishu WebSocket re-delivery
+    const { store } = getBridgeContext();
+    if (store.checkDedup(`msg:${msg.message_id}`)) {
+      console.log(`[feishu-adapter] DEDUP hit (persistent): msgId=${msg.message_id}`);
+      return;
+    }
+    store.insertDedup(`msg:${msg.message_id}`);
     this.addToDedup(msg.message_id);
+    this.recentMessageIds.add(msg.message_id);
 
     const chatId = msg.chat_id;
     // [P2] Complete sender ID fallback chain: open_id > user_id > union_id
