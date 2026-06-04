@@ -32,6 +32,37 @@ import {
 
 const GLOBAL_KEY = '__bridge_manager__';
 
+/**
+ * Validate a cwd path from chat description against security rules:
+ * 1. Must pass validateWorkingDirectory (absolute, no .., no metacharacters)
+ * 2. Must exist on disk
+ * 3. After symlink resolution, must be within allowed root (default: $HOME)
+ * Returns validated realpath or null if rejected.
+ */
+function validateCwdFromDescription(rawPath: string): string | null {
+  const validated = validateWorkingDirectory(rawPath);
+  if (!validated) return null;
+
+  if (!fs.existsSync(validated)) return null;
+
+  // Resolve symlinks to prevent symlink-based escapes
+  let realPath: string;
+  try {
+    realPath = fs.realpathSync(validated);
+  } catch {
+    return null;
+  }
+
+  // Must be within allowed root (configurable, defaults to /root or $HOME)
+  const { store } = getBridgeContext();
+  const allowedRoot = store.getSetting('bridge_allowed_cwd_root') || process.env.HOME || '/root';
+  if (!realPath.startsWith(allowedRoot + '/') && realPath !== allowedRoot) {
+    return null;
+  }
+
+  return realPath;
+}
+
 // ── Streaming preview helpers ──────────────────────────────────
 
 /** Generate a non-zero random 31-bit integer for use as draft_id. */
@@ -148,6 +179,8 @@ interface BridgeManagerState {
   activeTasks: Map<string, AbortController>;
   /** Per-session processing chains for concurrency control */
   sessionLocks: Map<string, Promise<void>>;
+  /** Per-session pending message queue for batch merging */
+  sessionPending: Map<string, InboundMessage[]>;
   autoStartChecked: boolean;
 }
 
@@ -162,12 +195,16 @@ export function getState(): BridgeManagerState {
       loopAborts: new Map(),
       activeTasks: new Map(),
       sessionLocks: new Map(),
+      sessionPending: new Map(),
       autoStartChecked: false,
     };
   }
   // Backfill sessionLocks for states created before this field existed
   if (!g[GLOBAL_KEY].sessionLocks) {
     g[GLOBAL_KEY].sessionLocks = new Map();
+  }
+  if (!g[GLOBAL_KEY].sessionPending) {
+    g[GLOBAL_KEY].sessionPending = new Map();
   }
   return g[GLOBAL_KEY];
 }
@@ -189,6 +226,26 @@ function processWithSessionLock(sessionId: string, fn: () => Promise<void>): Pro
     }
   }).catch(() => {});
   return current;
+}
+
+/**
+ * Merge multiple pending messages into a single InboundMessage.
+ * Preserves the first message's metadata, combines text with sender labels.
+ */
+function mergeMessages(messages: InboundMessage[]): InboundMessage {
+  if (messages.length === 1) return messages[0];
+  const base = messages[0];
+  const mergedText = messages.map(m => {
+    const sender = m.senderName || '用户';
+    const prefix = m.senderType === 'bot' ? `[来自机器人: ${sender}]` : `[${sender}]`;
+    return `${prefix} ${m.text}`;
+  }).join('\n\n');
+  return {
+    ...base,
+    text: mergedText,
+    // Clear senderName since multiple senders are embedded in text
+    senderName: undefined,
+  };
 }
 
 /**
@@ -363,6 +420,107 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
   const abort = new AbortController();
   state.loopAborts.set(adapter.channelType, abort);
 
+  // Register message recall handler to remove from pending queue
+  if ((adapter as any).onMessageRecalled === undefined || (adapter as any).onMessageRecalled === null) {
+    (adapter as any).onMessageRecalled = (messageId: string) => {
+      for (const [sessionId, pending] of state.sessionPending) {
+        const before = pending.length;
+        const filtered = pending.filter(m => m.messageId !== messageId);
+        if (filtered.length < before) {
+          console.log(`[bridge-manager] Removed recalled message ${messageId} from pending queue (session ${sessionId.slice(0, 8)})`);
+          if (filtered.length === 0) {
+            state.sessionPending.delete(sessionId);
+          } else {
+            state.sessionPending.set(sessionId, filtered);
+          }
+        }
+      }
+    };
+  }
+
+  // Register bot-added-to-chat handler: auto-set workingDirectory from chat info
+  if (!(adapter as any).onBotAddedToChat) {
+    (adapter as any).onBotAddedToChat = async (chatId: string) => {
+      try {
+        const { store } = getBridgeContext();
+        // Check if groupConfig already has a workingDirectory for this chat
+        const groupConfig = getGroupConfig(store);
+        if (groupConfig?.[chatId]?.workingDirectory) return;
+
+        // Try to get chat info (name/description) to match a project directory
+        const appId = store.getSetting('bridge_feishu_app_id') || process.env.CTI_FEISHU_APP_ID || '';
+        const appSecret = store.getSetting('bridge_feishu_app_secret') || process.env.CTI_FEISHU_APP_SECRET || '';
+        const domain = store.getSetting('bridge_feishu_domain') || process.env.CTI_FEISHU_DOMAIN || 'feishu.cn';
+        if (!appId || !appSecret) return;
+
+        const tokenRes = await fetch(`https://open.${domain}/open-apis/auth/v3/tenant_access_token/internal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+        });
+        const tokenData: any = await tokenRes.json();
+        if (!tokenData.tenant_access_token) return;
+
+        const chatRes = await fetch(`https://open.${domain}/open-apis/im/v1/chats/${chatId}`, {
+          headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` },
+        });
+        const chatData: any = await chatRes.json();
+        const chatName = chatData?.data?.name || '';
+        const chatDescription = chatData?.data?.description || '';
+
+        // Parse workingDirectory from description (format: "cwd:/path" or "cwd: /path" anywhere in description)
+        const cwdMatch = chatDescription.match(/cwd[：:]\s*([^\s\n]+)/i);
+        if (cwdMatch) {
+          const targetDir = validateCwdFromDescription(cwdMatch[1]);
+          if (targetDir) {
+            const binding = router.resolve({ channelType: adapter.channelType, chatId });
+            router.updateBinding(binding.id, { workingDirectory: targetDir, sdkSessionId: '' });
+            console.log(`[bridge-manager] Auto-configured workingDirectory for chat ${chatId} (${chatName}): ${targetDir}`);
+          }
+        }
+      } catch (err) {
+        console.warn('[bridge-manager] Failed to auto-configure chat workingDirectory:', err);
+      }
+    };
+  }
+
+  // Register chat description change handler: auto-update workingDirectory
+  if (!(adapter as any).onChatDescriptionChanged) {
+    (adapter as any).onChatDescriptionChanged = (chatId: string, description: string) => {
+      try {
+        const cwdMatch = description.match(/cwd[：:]\s*([^\s\n]+)/i);
+        if (!cwdMatch) {
+          console.log(`[bridge-manager] Chat description changed but no cwd: found (chat ${chatId})`);
+          return;
+        }
+        const targetDir = validateCwdFromDescription(cwdMatch[1]);
+        if (!targetDir) {
+          console.warn(`[bridge-manager] Chat description cwd rejected: ${cwdMatch[1]} (chat ${chatId})`);
+          deliver(adapter, {
+            address: { channelType: adapter.channelType, chatId },
+            text: `⚠️ 路径不允许: <code>${escapeHtml(cwdMatch[1])}</code>\n仅允许 /root/ 下的项目目录`,
+            parseMode: 'HTML',
+          }).catch(() => {});
+          return;
+        }
+        const binding = router.resolve({ channelType: adapter.channelType, chatId });
+        if (targetDir === binding.workingDirectory) {
+          console.log(`[bridge-manager] Chat description cwd unchanged: ${targetDir} (chat ${chatId})`);
+          return;
+        }
+        router.updateBinding(binding.id, { workingDirectory: targetDir, sdkSessionId: '' });
+        console.log(`[bridge-manager] Chat description changed — updated cwd to ${targetDir} (chat ${chatId})`);
+        deliver(adapter, {
+          address: { channelType: adapter.channelType, chatId },
+          text: `📂 工作目录已切换: <code>${escapeHtml(targetDir)}</code>\n下一轮对话生效`,
+          parseMode: 'HTML',
+        }).catch(() => {});
+      } catch (err) {
+        console.warn('[bridge-manager] Failed to update cwd from chat description change:', err);
+      }
+    };
+  }
+
   (async () => {
     while (state.running && adapter.isRunning()) {
       try {
@@ -383,15 +541,46 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
           isNumericPermissionShortcut(adapter.channelType, msg.text.trim(), msg.address.chatId)
         ) {
           await handleMessage(adapter, msg);
+        } else if (msg.contextOnly) {
+          // Context-only messages (not @mentioned in multi-bot): skip entirely
+          // Do NOT queue them for merge — they should never trigger a response.
+          await handleMessage(adapter, msg);
         } else {
           const binding = router.resolve(msg.address);
-          // Fire-and-forget into session lock — loop continues to accept
-          // messages for other sessions immediately.
-          processWithSessionLock(binding.codepilotSessionId, () =>
-            handleMessage(adapter, msg),
-          ).catch(err => {
-            console.error(`[bridge-manager] Session ${binding.codepilotSessionId.slice(0, 8)} error:`, err);
-          });
+          const sessionId = binding.codepilotSessionId;
+
+          // Message merging: only for group chats where multiple people may send
+          // messages while the bot is busy. Private chats process sequentially.
+          if (msg.isGroup && state.sessionLocks.has(sessionId)) {
+            const pending = state.sessionPending.get(sessionId) || [];
+            pending.push(msg);
+            state.sessionPending.set(sessionId, pending);
+            console.log(`[bridge-manager] Queued message for merge (session ${sessionId.slice(0, 8)}, pending: ${pending.length})`);
+          } else if (msg.isGroup) {
+            // Group chat, session free — process with drain logic
+            processWithSessionLock(sessionId, async () => {
+              const drainAndProcess = async (firstMsg: InboundMessage) => {
+                await handleMessage(adapter, firstMsg);
+                const pending = state.sessionPending.get(sessionId);
+                if (pending && pending.length > 0) {
+                  state.sessionPending.delete(sessionId);
+                  const merged = mergeMessages(pending);
+                  console.log(`[bridge-manager] Merged ${pending.length} pending messages (session ${sessionId.slice(0, 8)})`);
+                  await drainAndProcess(merged);
+                }
+              };
+              await drainAndProcess(msg);
+            }).catch(err => {
+              console.error(`[bridge-manager] Session ${sessionId.slice(0, 8)} error:`, err);
+            });
+          } else {
+            // Private chat — sequential processing, no merge
+            processWithSessionLock(sessionId, () =>
+              handleMessage(adapter, msg),
+            ).catch(err => {
+              console.error(`[bridge-manager] Session ${sessionId.slice(0, 8)} error:`, err);
+            });
+          }
         }
       } catch (err) {
         if (abort.signal.aborted) break;
@@ -771,7 +960,7 @@ async function processRegularMessage(
   }
 
   // Regular message — route to conversation engine
-  const binding = router.resolve(msg.address);
+  let binding = router.resolve(msg.address);
 
   // Notify adapter that message processing is starting (e.g., typing indicator)
   adapter.onMessageStart?.(msg.address.chatId);
@@ -961,7 +1150,8 @@ async function processRegularMessage(
 
     // Chat environment context — injected as system prompt (not user message)
     // to avoid being treated as prompt injection by the AI safety layer.
-    const senderLabel = msg.senderName || msg.address.displayName || '用户';
+    const isMergedMessage = !msg.senderName && msg.text.includes('\n\n[');
+    const senderLabel = isMergedMessage ? '多人（见消息内容）' : (msg.senderName || msg.address.displayName || '用户');
     let chatContext: string;
     if (msg.isGroup) {
       const multiBotEnabled = store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
@@ -995,6 +1185,31 @@ async function processRegularMessage(
         if (chatConfig?.systemPrompt) {
           chatContext += `\n\n${chatConfig.systemPrompt}`;
         }
+        // Per-group working directory: ensures all bots in the same group share cwd
+        if (chatConfig?.workingDirectory && chatConfig.workingDirectory !== binding.workingDirectory) {
+          router.updateBinding(binding.id, { workingDirectory: chatConfig.workingDirectory });
+          binding = router.resolve(msg.address);
+        }
+      }
+      // cwd from chat description is handled by im.chat.updated_v1 event (real-time).
+      // Fallback: only on first message when cwd is still default (covers bot just joined).
+      const defaultWorkDir = store.getSetting('bridge_default_work_dir') || process.env.HOME || '/root';
+      if (msg.isGroup && binding.workingDirectory === defaultWorkDir) {
+        try {
+          const chatInfo = await (adapter as any).resolveChatInfo?.(msg.address.chatId.split(':thread:')[0]);
+          const chatDescription = chatInfo?.description || '';
+          if (chatDescription) {
+            const cwdMatch = chatDescription.match(/cwd[：:]\s*([^\s\n]+)/i);
+            if (cwdMatch && cwdMatch[1] !== binding.workingDirectory) {
+              const validatedCwd = validateCwdFromDescription(cwdMatch[1]);
+              if (validatedCwd) {
+                router.updateBinding(binding.id, { workingDirectory: validatedCwd, sdkSessionId: '' });
+                binding = router.resolve(msg.address);
+                console.log(`[bridge-manager] Auto-discovered cwd from chat description: ${validatedCwd}`);
+              }
+            }
+          }
+        } catch { /* best effort */ }
       }
     } else {
       chatContext = `[私聊环境] 这是与${senderLabel}的一对一私聊。`;
@@ -1145,13 +1360,48 @@ async function processRegularMessage(
         await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
       }
     } else if (result.hasError) {
-      const errorResponse: OutboundMessage = {
-        address: msg.address,
-        text: `<b>Error:</b> ${escapeHtml(result.errorMessage)}`,
-        parseMode: 'HTML',
-        replyToMessageId: msg.messageId,
-      };
-      await deliver(adapter, errorResponse);
+      // Retriable: context window full — clear session and retry once
+      if (result.errorMessage && /Context window is full/i.test(result.errorMessage)) {
+        if (binding.id) {
+          store.updateChannelBinding(binding.id, { sdkSessionId: '' });
+          console.log(`[bridge-manager] Context full — cleared session, retrying`);
+        }
+        // Retry with fresh session (binding now has empty sdkSessionId)
+        const freshBinding = router.resolve(msg.address);
+        const retryResult = await engine.processMessage(
+          freshBinding, promptText, async (perm) => {
+            await broker.forwardPermissionRequest(
+              adapter, msg.address, perm.permissionRequestId,
+              perm.toolName, perm.toolInput, freshBinding.codepilotSessionId, perm.suggestions,
+            );
+          },
+          taskAbort.signal, undefined, onPartialText, onToolEvent, undefined, chatContext,
+        );
+        if (retryResult.responseText) {
+          const retryCardFinalized = hasStreamingCards && adapter.onStreamEnd
+            ? await adapter.onStreamEnd(msg.address.chatId, 'completed', retryResult.responseText, {
+                tokenUsage: retryResult.tokenUsage ? {
+                  input: retryResult.tokenUsage.input_tokens ?? 0,
+                  output: retryResult.tokenUsage.output_tokens ?? 0,
+                } : undefined,
+              })
+            : false;
+          if (!retryCardFinalized) {
+            await deliverResponse(adapter, msg.address, retryResult.responseText, freshBinding.codepilotSessionId, msg.messageId);
+          }
+        }
+        if (freshBinding.id && retryResult.sdkSessionId) {
+          store.updateChannelBinding(freshBinding.id, { sdkSessionId: retryResult.sdkSessionId });
+        }
+      } else {
+        const errorResponse: OutboundMessage = {
+          address: msg.address,
+          text: `<b>Error:</b> ${escapeHtml(result.errorMessage)}`,
+          parseMode: 'HTML',
+          replyToMessageId: msg.messageId,
+        };
+        await deliver(adapter, errorResponse);
+      }
     }
 
     // Persist the actual SDK session ID for future resume.
@@ -1524,14 +1774,9 @@ async function handleCommand(
     }
 
     case '/compact': {
-      const binding = router.resolve(msg.address);
-      if (!binding.sdkSessionId) {
-        response = 'No active session to compact.';
-        break;
-      }
-      router.updateBinding(binding.id, { sdkSessionId: '' });
-      response = 'Session context cleared. Next message starts a fresh session.';
-      break;
+      // Forward to Claude Code CLI which handles real compaction (summarize context)
+      await forwardToAI(adapter, msg, text);
+      return;
     }
 
     case '/perm': {
@@ -1594,7 +1839,7 @@ async function handleCommand(
         '/sessions - List recent sessions',
         '/resume [n] - Resume a previous session',
         '/stop - Stop current session',
-        '/compact - Clear session context',
+        '/compact - Compress conversation context (keeps summary)',
         '/think low|medium|high|max|off - Set thinking effort',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
         '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
@@ -1656,8 +1901,7 @@ export function computeSdkSessionUpdate(
   errorMessage?: string,
 ): string | null {
   // Unrecoverable errors: force-clear session even if SDK returned a session ID.
-  // These errors mean the session transcript is too large to ever resume.
-  if (hasError && errorMessage && /too large|32MB|Request.*large/i.test(errorMessage)) {
+  if (hasError && errorMessage && /too large|32MB|Request.*large|Context window is full/i.test(errorMessage)) {
     return '';
   }
   if (sdkSessionId) {
@@ -1678,6 +1922,7 @@ import http from 'node:http';
 import { parentPort, isMainThread } from 'node:worker_threads';
 
 let relayServer: http.Server | null = null;
+let relaySecretCached: string = '';
 
 // Pending relay ack/nack tracking for Worker thread mode
 const pendingRelays = new Map<string, { resolve: (ok: boolean) => void; timer: ReturnType<typeof setTimeout> }>();
@@ -1725,10 +1970,20 @@ export function startRelayServer(): void {
 
   parseRelayPeersFromSetting();
 
+  const relaySecret = store.getSetting('bridge_relay_secret') || process.env.CTI_RELAY_SECRET || '';
+  relaySecretCached = relaySecret;
+  const relayHost = store.getSetting('bridge_relay_host') || process.env.CTI_RELAY_HOST || '127.0.0.1';
+
   relayServer = http.createServer(async (req, res) => {
     if (req.method !== 'POST' || req.url !== '/relay') {
       res.writeHead(404);
       res.end('Not found');
+      return;
+    }
+
+    if (relaySecret && req.headers['x-relay-token'] !== relaySecret) {
+      res.writeHead(401);
+      res.end('Unauthorized');
       return;
     }
 
@@ -1825,8 +2080,11 @@ export function startRelayServer(): void {
     }
   });
 
-  relayServer.listen(port, () => {
-    console.log(`[relay-server] Listening on port ${port}`);
+  relayServer.requestTimeout = 10_000;
+  relayServer.headersTimeout = 5_000;
+
+  relayServer.listen(port, relayHost, () => {
+    console.log(`[relay-server] Listening on ${relayHost}:${port}${relaySecret ? ' (auth enabled)' : ' (WARNING: no auth)'}`);
     if (relayPeers.size > 0) {
       console.log(`[relay-server] Known peers: ${Array.from(relayPeers.entries()).map(([n, p]) => `${n}@${p.host}:${p.port}`).join(', ')}`);
     }
@@ -1850,7 +2108,7 @@ export function getRelayPeerNames(): string[] {
  * Send a relay message to a peer bot by name.
  * Returns true if the message was sent successfully.
  */
-export async function relayToBot(botName: string, chatId: string, text: string, senderName: string, replyMessageId?: string): Promise<boolean> {
+export async function relayToBot(botName: string, chatId: string, text: string, senderName: string, replyMessageId?: string, returnBody?: boolean): Promise<boolean | string> {
   // Worker thread mode: relay via parentPort to orchestrator with ack/nack
   if (!isMainThread && parentPort) {
     const correlationId = `relay-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1873,26 +2131,39 @@ export async function relayToBot(botName: string, chatId: string, text: string, 
   const peer = relayPeers.get(botName.toLowerCase());
   if (!peer) {
     console.warn(`[relay-server] Unknown peer bot: ${botName}`);
-    return false;
+    return returnBody ? '' : false;
   }
 
   const payload = JSON.stringify({ chatId, text, senderName, senderType: 'bot', replyMessageId });
+  const headers: Record<string, string | number> = {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(payload),
+  };
+  if (relaySecretCached) {
+    headers['x-relay-token'] = relaySecretCached;
+  }
 
-  return new Promise<boolean>((resolve) => {
+  return new Promise<boolean | string>((resolve) => {
     const req = http.request({
       hostname: peer.host,
       port: peer.port,
       path: '/relay',
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      headers,
       timeout: 5000,
     }, (res) => {
-      res.resume();
-      resolve(res.statusCode === 200);
+      if (returnBody) {
+        const chunks: Buffer[] = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks).toString()));
+      } else {
+        res.resume();
+        resolve(res.statusCode === 200);
+      }
     });
     req.on('error', (err) => {
       console.warn(`[relay-server] Failed to relay to ${botName}:`, err.message);
-      resolve(false);
+      resolve(returnBody ? '' : false);
     });
     req.write(payload);
     req.end();

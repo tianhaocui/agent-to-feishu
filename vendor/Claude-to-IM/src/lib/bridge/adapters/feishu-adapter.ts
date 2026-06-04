@@ -173,6 +173,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private botOpenId: string | null = null;
   /** Bot's display name from /bot/v3/info/ API. */
   public botName: string | null = null;
+  /** Callback for message recall events — used by bridge-manager to remove from pending queue. */
+  public onMessageRecalled?: (messageId: string) => void;
+  /** Callback when bot is added to a new chat — used for auto-configuring workingDirectory. */
+  public onBotAddedToChat?: (chatId: string) => void;
+  /** Callback when chat description changes — used for updating workingDirectory. */
+  public onChatDescriptionChanged?: (chatId: string, description: string) => void;
   /** All known bot IDs (open_id, user_id, union_id) for mention matching. */
   private botIds = new Set<string>();
   /** Track last incoming message ID per chat for typing indicator. */
@@ -194,7 +200,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   /** LRU cache: openId -> display name (TTL 30min, max 500). */
   private userNameCache = new LruCache<string>(500, 30 * 60 * 1000);
   /** LRU cache: chatId -> chat info (TTL 1hr, max 500). */
-  private chatInfoCache = new LruCache<{ name: string; chatMode?: string; groupMessageType?: string }>(500, 60 * 60 * 1000);
+  private chatInfoCache = new LruCache<{ name: string; chatMode?: string; groupMessageType?: string; description?: string }>(500, 60 * 60 * 1000);
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -264,6 +270,30 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }) as any,
       'im.message.reaction.created_v1': (async (data: unknown) => {
         await this.handleReactionEvent(data);
+      }) as any,
+      'im.message.recalled_v1': (async (data: unknown) => {
+        const msgId = (data as any)?.message_id;
+        if (msgId) {
+          console.log(`[feishu-adapter] Message recalled: ${msgId}`);
+          this.onMessageRecalled?.(msgId);
+        }
+      }) as any,
+      'im.chat.member.bot.added_v1': (async (data: unknown) => {
+        const chatId = (data as any)?.chat_id;
+        if (chatId) {
+          console.log(`[feishu-adapter] Bot added to chat: ${chatId}`);
+          this.onBotAddedToChat?.(chatId);
+        }
+      }) as any,
+      'im.chat.updated_v1': (async (data: unknown) => {
+        const chatId = (data as any)?.chat_id;
+        const afterChange = (data as any)?.after_change;
+        console.log(`[feishu-adapter] Chat updated: ${chatId}`, JSON.stringify(afterChange || {}).slice(0, 200));
+        if (chatId && afterChange?.description) {
+          // Invalidate cache so next resolveChatInfo fetches fresh data
+          this.chatInfoCache.delete(chatId);
+          this.onChatDescriptionChanged?.(chatId, afterChange.description);
+        }
       }) as any,
     });
 
@@ -371,7 +401,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
           allKnown = false;
         }
         try {
-          await relayToBot(peerName, '__identity__', myIdentity, this.botName || 'unknown');
+          const responseBody = await relayToBot(peerName, '__identity__', myIdentity, this.botName || 'unknown', undefined, true) as string;
+          if (responseBody) {
+            try {
+              const peer = JSON.parse(responseBody);
+              if (peer.type === 'identity' && peer.name && peer.openId) {
+                this.registerPeerBot(peer.name, peer.openId);
+              }
+            } catch { /* not valid JSON, ignore */ }
+          }
         } catch { /* retry next interval */ }
       }
 
@@ -2696,7 +2734,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   // ── Chat Info Resolution ──────────────────────────────────
 
   /** Resolve group chat info via im.chat.get API, cache result. */
-  private async resolveChatInfo(chatId: string): Promise<{ name: string; chatMode?: string; groupMessageType?: string } | undefined> {
+  async resolveChatInfo(chatId: string): Promise<{ name: string; chatMode?: string; groupMessageType?: string; description?: string } | undefined> {
     const cached = this.chatInfoCache.get(chatId);
     if (cached !== undefined) return cached;
     if (!this.restClient) return undefined;
@@ -2708,6 +2746,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
           name: data.name || '',
           chatMode: data.chat_mode as string | undefined,
           groupMessageType: data.group_message_type as string | undefined,
+          description: data.description as string | undefined,
         };
         this.chatInfoCache.set(chatId, info);
         return info;

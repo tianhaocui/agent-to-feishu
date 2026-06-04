@@ -25,6 +25,8 @@ import { CTI_HOME } from './config.js';
 const DATA_DIR = path.join(CTI_HOME, 'data');
 const MESSAGES_DIR = path.join(DATA_DIR, 'messages');
 
+const SESSION_ID_RE = /^[a-f0-9-]{1,64}$/;
+
 // ── Helpers ──
 
 function ensureDir(dir: string): void {
@@ -178,6 +180,7 @@ export class JsonFileStore implements BridgeStore {
   }
 
   private persistMessages(sessionId: string): void {
+    if (!SESSION_ID_RE.test(sessionId)) return;
     const msgs = this.messages.get(sessionId) || [];
     writeJson(path.join(MESSAGES_DIR, `${sessionId}.json`), msgs);
   }
@@ -186,6 +189,7 @@ export class JsonFileStore implements BridgeStore {
     if (this.messages.has(sessionId)) {
       return this.messages.get(sessionId)!;
     }
+    if (!SESSION_ID_RE.test(sessionId)) return [];
     const msgs = readJson<BridgeMessage[]>(
       path.join(MESSAGES_DIR, `${sessionId}.json`),
       [],
