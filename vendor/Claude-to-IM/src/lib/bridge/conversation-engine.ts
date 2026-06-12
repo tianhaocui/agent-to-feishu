@@ -248,11 +248,33 @@ async function consumeStream(
   const permissionRequests: PermissionRequestInfo[] = [];
   let capturedSdkSessionId: string | null = null;
   let capturedModel: string | undefined;
+  let receivedAnyEvent = false;
+  const FIRST_EVENT_TIMEOUT_MS = 30_000;
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      // Only apply timeout before the first event (detect stale sessions).
+      // Once any event arrives, wait indefinitely (tools can run for minutes).
+      let readResult: { done: boolean; value?: string };
+      if (!receivedAnyEvent) {
+        const readPromise = reader.read() as Promise<{ done: boolean; value?: string }>;
+        const timeoutPromise = new Promise<{ done: boolean; value?: string }>((resolve) =>
+          setTimeout(() => resolve({ done: true }), FIRST_EVENT_TIMEOUT_MS),
+        );
+        readResult = await Promise.race([readPromise, timeoutPromise]);
+      } else {
+        readResult = await reader.read() as { done: boolean; value?: string };
+      }
+      if (readResult.done || !readResult.value) {
+        if (!receivedAnyEvent) {
+          hasError = true;
+          errorMessage = 'Stream timeout: no response from Claude Code within 30s (stale_session_retry)';
+          console.warn(`[conversation-engine] Stream timeout — no events received in ${FIRST_EVENT_TIMEOUT_MS}ms (session=${sessionId.slice(0, 8)})`);
+        }
+        break;
+      }
+      const value = readResult.value;
+      receivedAnyEvent = true;
 
       if (streamOpts?.onActivity) streamOpts.onActivity();
 

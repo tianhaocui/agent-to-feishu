@@ -35,6 +35,9 @@ export class FeishuPairingAdapter extends BaseChannelAdapter {
   registerPeerBot(name: string, openId: string): void {
     (this.inner as any).registerPeerBot?.(name, openId);
   }
+  resolveChatInfo(chatId: string): Promise<any> {
+    return (this.inner as any).resolveChatInfo?.(chatId);
+  }
   private readonly inner = new UpstreamFeishuAdapter();
   private readonly pairingStore = getFeishuPairingStore();
 
@@ -148,8 +151,8 @@ export class FeishuPairingAdapter extends BaseChannelAdapter {
     this.inner.onToolEvent?.(chatId, tools);
   }
 
-  onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
-    return this.inner.onStreamEnd ? this.inner.onStreamEnd(chatId, status, responseText) : Promise.resolve(false);
+  onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string, meta?: Record<string, unknown>): Promise<boolean> {
+    return this.inner.onStreamEnd ? this.inner.onStreamEnd(chatId, status, responseText, meta as any) : Promise.resolve(false);
   }
 
   injectMessage(msg: InboundMessage): void {

@@ -591,6 +591,7 @@ export class SDKLLMProvider implements LLMProvider {
               thinking: { type: 'adaptive' },
               effort: getBridgeContext().store.getSetting('bridge_thinking_effort') || undefined,
               includePartialMessages: true,
+              autoCompactEnabled: true,
               mcpServers: loadMcpServers(),
               settingSources: ['user', 'project', 'local'],
               sandbox: { enabled: false },
