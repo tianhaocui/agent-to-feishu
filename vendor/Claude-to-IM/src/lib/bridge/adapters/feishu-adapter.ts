@@ -2072,6 +2072,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
         : undefined;
 
       const result = await this.extractQuotedContent(item);
+      if (result?.text) {
+        // Strip Feishu rich-text tags that may leak into card rendering
+        result.text = result.text.replace(/<at[^>]*>([^<]*)<\/at>/g, (_, name) => name ? `@${name}` : '');
+      }
       return result ? { ...result, senderName } : null;
     } catch (err) {
       console.warn('[feishu-adapter] Failed to fetch quoted message:', parentId, err);
