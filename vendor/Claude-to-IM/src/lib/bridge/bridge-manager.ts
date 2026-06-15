@@ -1357,7 +1357,11 @@ async function processRegularMessage(
     // Skip if streaming card was finalized (content already in card).
     if (result.responseText) {
       if (!cardFinalized) {
-        await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+        const sendResult = await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+        // Card path handles relay in onStreamEnd; non-card path needs explicit relay
+        if (sendResult.ok && (adapter as any).relayMentionsIfNeeded) {
+          await (adapter as any).relayMentionsIfNeeded(msg.address.chatId, result.responseText, sendResult.messageId);
+        }
       }
     } else if (result.hasError) {
       // Retriable: context window full — clear session and retry once

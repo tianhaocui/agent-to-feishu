@@ -1231,46 +1231,54 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const result = await this.finalizeCard(chatId, status, responseText, meta);
 
     // Multi-bot: relay mentions to peer bots via HTTP (group chats only)
-    const multiBotEnabled = getBridgeContext().store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
-    if (multiBotEnabled && status === 'completed' && responseText && this.groupChatIds.has(chatId)) {
-      const { relayToBot, getRelayPeerNames } = await import('../bridge-manager.js');
-      const relayedBots = new Set<string>();
-
-      // 1. @[BotName] format
-      const bracketPattern = /@\[([^\]]+)\]/g;
-      let match;
-      while ((match = bracketPattern.exec(responseText)) !== null) {
-        relayedBots.add(match[1]);
-      }
-      // 2. @BotName format — match against known bot names and relay peers
-      const checkNames = new Set([...this.knownBots.keys(), ...getRelayPeerNames()]);
-      for (const name of checkNames) {
-        if (relayedBots.has(name)) continue;
-        const pattern = new RegExp(`@${escapeRegex(name)}(?![\\w])`, 'gi');
-        if (pattern.test(responseText)) {
-          relayedBots.add(name);
-        }
-      }
-
-      const myName = this.knownBotsByOpenId.get(this.botOpenId || '') || this.botName || 'unknown';
-
-      for (const botName of relayedBots) {
-        try {
-          const sent = await relayToBot(botName, chatId, responseText, myName, cardMessageId);
-          if (sent) {
-            console.log(`[feishu-adapter] Relayed to ${botName} via HTTP (replyMessageId=${cardMessageId})`);
-          } else {
-            console.warn(`[feishu-adapter] HTTP relay failed for ${botName}`);
-          }
-        } catch (err) {
-          console.warn(`[feishu-adapter] Relay error for ${botName}:`, err);
-        }
-      }
+    if (status === 'completed' && responseText) {
+      await this.relayMentionsIfNeeded(chatId, responseText, cardMessageId);
     }
 
     return result;
   }
 
+  /**
+   * Detect @bot mentions in text and relay to peer bots via HTTP.
+   * Called after both streaming card finalize and post/card fallback sends.
+   */
+  async relayMentionsIfNeeded(chatId: string, text: string, replyMessageId?: string): Promise<void> {
+    const multiBotEnabled = getBridgeContext().store.getSetting('bridge_feishu_multi_bot_enabled') === 'true';
+    if (!multiBotEnabled || !text || !this.groupChatIds.has(chatId)) return;
+
+    const { relayToBot, getRelayPeerNames } = await import('../bridge-manager.js');
+    const relayedBots = new Set<string>();
+
+    const bracketPattern = /@\[([^\]]+)\]/g;
+    let match;
+    while ((match = bracketPattern.exec(text)) !== null) {
+      relayedBots.add(match[1]);
+    }
+    const checkNames = new Set([...this.knownBots.keys(), ...getRelayPeerNames()]);
+    for (const name of checkNames) {
+      if (relayedBots.has(name)) continue;
+      const pattern = new RegExp(`@${escapeRegex(name)}(?![\\w])`, 'gi');
+      if (pattern.test(text)) {
+        relayedBots.add(name);
+      }
+    }
+
+    if (relayedBots.size === 0) return;
+
+    const myName = this.knownBotsByOpenId.get(this.botOpenId || '') || this.botName || 'unknown';
+    for (const botName of relayedBots) {
+      try {
+        const sent = await relayToBot(botName, chatId, text, myName, replyMessageId);
+        if (sent) {
+          console.log(`[feishu-adapter] Relayed to ${botName} via HTTP (replyMessageId=${replyMessageId || 'none'})`);
+        } else {
+          console.warn(`[feishu-adapter] HTTP relay failed for ${botName}`);
+        }
+      } catch (err) {
+        console.warn(`[feishu-adapter] Relay error for ${botName}:`, err);
+      }
+    }
+  }
   // ── Send ────────────────────────────────────────────────────
 
   async send(message: OutboundMessage): Promise<SendResult> {
