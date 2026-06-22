@@ -859,7 +859,9 @@ async function handleMessage(
         if (isAskQuestion && askData && idx - 1 < askData.options.length) {
           const selectedLabel = askData.options[idx - 1];
           const { permissions } = getBridgeContext();
-          const resolved = permissions.resolvePendingPermission(link.permissionRequestId, {
+          // Strip _fallback suffix to resolve the actual pending permission
+          const actualPermId = link.permissionRequestId.replace(/_fallback$/, '');
+          const resolved = permissions.resolvePendingPermission(actualPermId, {
             behavior: 'allow',
             updatedInput: { answers: { [askData.questionText]: selectedLabel } },
           });
@@ -869,6 +871,7 @@ async function handleMessage(
               adapter.editMessage(link.messageId, `✅ ${askData.questionText} → ${selectedLabel}`).catch(() => {});
             }
             try { store.markPermissionLinkResolved(link.permissionRequestId); } catch { /* best effort */ }
+            try { store.markPermissionLinkResolved(actualPermId); } catch { /* best effort */ }
           }
           ack();
           return;
@@ -1341,6 +1344,7 @@ async function processRegularMessage(
           cacheCreation: result.tokenUsage.cache_creation_input_tokens ?? undefined,
         } : undefined,
         model: result.model || undefined,
+        errorMessage: result.hasError ? result.errorMessage : undefined,
         splitRelay: (mentionTracker && mentionTracker.relayedSegments.length > 0)
           ? { relayed: mentionTracker.relayedSegments, splitOffset: mentionTracker.splitOffset }
           : undefined,

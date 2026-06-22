@@ -134,6 +134,7 @@ export abstract class BaseChannelAdapter {
 export interface StreamEndMeta {
   tokenUsage?: { input: number; output: number; cacheRead?: number; cacheCreation?: number };
   model?: string;
+  errorMessage?: string;
   splitRelay?: { relayed: { targetBot: string; text: string }[]; splitOffset: number };
 }
 

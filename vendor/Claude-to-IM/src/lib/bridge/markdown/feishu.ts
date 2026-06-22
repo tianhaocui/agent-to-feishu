@@ -266,6 +266,7 @@ interface FinalCardFooter {
   reasoningElapsedMs?: number;
   tokenUsage?: { input: number; output: number; cacheRead?: number; cacheCreation?: number } | null;
   model?: string;
+  errorMessage?: string;
 }
 
 /**
@@ -344,6 +345,11 @@ export function buildFinalCardJson(
     const label = statusLabels[footer.status] || { zh: footer.status, en: footer.status };
     const zhParts = [label.zh];
     const enParts = [label.en];
+    if (footer.status === 'error' && footer.errorMessage) {
+      const short = footer.errorMessage.length > 80 ? footer.errorMessage.slice(0, 80) + '…' : footer.errorMessage;
+      zhParts[0] = `出错（${short}）`;
+      enParts[0] = `Error (${short})`;
+    }
     if (footer.elapsed) {
       zhParts.push(`耗时 ${footer.elapsed}`);
       enParts.push(`Elapsed ${footer.elapsed}`);

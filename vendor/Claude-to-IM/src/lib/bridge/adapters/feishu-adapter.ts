@@ -1089,6 +1089,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
           reasoningElapsedMs: state.reasoningElapsedMs || undefined,
           tokenUsage: meta?.tokenUsage || undefined,
           model: meta?.model || undefined,
+          errorMessage: meta?.errorMessage || undefined,
         });
 
         state.sequence++;
